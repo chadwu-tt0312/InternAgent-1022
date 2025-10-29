@@ -3,10 +3,15 @@ import os
 import re
 import sys
 import ast
+import asyncio
+import logging
 from pathlib import Path
 from tqdm import tqdm
 from easydict import EasyDict
 from multiprocessing import Pool
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class SettingManager():
@@ -238,13 +243,15 @@ The detail analysis of class and function in this file
 """
 
 class RepoViewer():
-    def __init__(self, setting_manager, repo_structure):
+    def __init__(self, setting_manager, repo_structure, config: Optional[Dict[str, Any]] = None):
         self.project_settings = setting_manager.project_settings
         self.llm_settings = setting_manager.chat_settings
         self.repo_structure = repo_structure
         self.file_paths, self.dict_paths = [], []
         self.get_path(repo_structure)
-        self.client_model = self.llm_settings.model
+        self.config = config or {}
+        self.codeview_config = self.config.get("codeview", {})
+        self.model_config = self.config.get("models", {})
     
     def get_path(self, repo_structure, dict_path=""):
         if repo_structure.get('children', None) is None:
@@ -259,7 +266,7 @@ class RepoViewer():
     def generate_docs(self):
         assert len(self.file_paths) == len(self.dict_paths)
         num_proc = self.llm_settings.num_proc
-        parallel_inputs = [(fpath, dpath, self.client_model, self.llm_settings) for fpath, dpath in zip(self.file_paths, self.dict_paths)]
+        parallel_inputs = [(fpath, dpath, self.model_config, self.codeview_config, self.llm_settings) for fpath, dpath in zip(self.file_paths, self.dict_paths)]
         group_nums = len(parallel_inputs) // num_proc if len(parallel_inputs) % num_proc == 0 else len(parallel_inputs) // num_proc +1
         all_results = []
         for group_idx in range(group_nums):
@@ -279,86 +286,94 @@ class RepoViewer():
 
     @staticmethod
     def generate_doc_single_static(config):
-        file_path, dict_path, client_model, llm_settings = config
-        print(f"-- Generating document for file {file_path}")
-        with open(file_path, 'r') as f:
-            code = f.read()
-        if client_model.lower().startswith('gpt'):
-            try: 
-                import openai
-                print(f"Using OpenAI API with model {client_model}")
-                client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-                response = client.chat.completions.create(
-                    model=client_model,
-                    messages=[
-                        {"role": "system", "content": CODE_VIEW_SYS_PROMPT},
-                        {"role": "user", "content": CODE_VIEW_PROMPT.format(code=code)}
-                    ],
-                    temperature=llm_settings.temperature,
-                    max_tokens=llm_settings.max_tokens
-                )
-                results = response.choices[0].message.content
-            except Exception as e:
-                print(f"Error during generate doc for file {file_path} using {client_model}.\n{e}")
-
-        elif client_model.lower().startswith('claude'):
-            try: 
-                import anthropic
-                print(f"Using Anthropic API with model {client_model}")
-                client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-                response = client.completions.create(
-                    model=client_model,
-                    system=CODE_VIEW_SYS_PROMPT,
-                    messages=[
-                        {"role": "user", "content": CODE_VIEW_PROMPT.format(code=code)}
-                    ],
-                    temperature=llm_settings.temperature,
-                    max_tokens_to_sample=llm_settings.max_tokens
-                )
-                results = response.completions[0].text
-            except Exception as e:
-                print(f"Error during generate doc for file {file_path} using {client_model}.\n{e}")
-
-        elif client_model.lower().startswith('deepseek'):
-            try:
-                import openai
-                print(f"Using DeepSeek model: {llm_settings.model}")
-                client_model = llm_settings.model
-                client = openai.OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url=os.environ.get("API_BASE"))
-                response = client.chat.completions.create(
-                    model=client_model,
-                    messages=[
-                        {"role": "system", "content": CODE_VIEW_SYS_PROMPT},
-                        {"role": "user", "content": CODE_VIEW_PROMPT.format(code=code)}
-                    ],
-                    temperature=llm_settings.temperature,
-                    max_tokens=llm_settings.max_tokens
-                )
-                results = response.choices[0].message.content
-            except Exception as e:
-                print(f"Error during generate doc for file {file_path} using {client_model}.\n{e}")
+        """
+        使用配置檔產生單一檔案的文檔。
         
-        elif client_model.lower().startswith('deepseek'):
-            try:
-                import openai
-                print(f"Using InternS1 model: {llm_settings.model}")
-                client_model = llm_settings.model
-                client = openai.OpenAI(api_key=os.environ.get("INS1_API_KEY"), base_url=os.environ.get("INS1_API_BASE_URL"))
-                response = client.chat.completions.create(
-                    model=client_model,
-                    messages=[
-                        {"role": "system", "content": CODE_VIEW_SYS_PROMPT},
-                        {"role": "user", "content": CODE_VIEW_PROMPT.format(code=code)}
-                    ],
-                    temperature=llm_settings.temperature,
-                    max_tokens=llm_settings.max_tokens
-                )
-                results = response.choices[0].message.content
-            except Exception as e:
-                print(f"Error during generate doc for file {file_path} using {client_model}.\n{e}")
+        Args:
+            config: (file_path, dict_path, model_config, codeview_config, llm_settings) 元組
+        """
+        file_path, dict_path, model_config, codeview_config, llm_settings = config
+        print(f"-- Generating document for file {file_path}")
+        
         try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                code = f.read()
+        except Exception as e:
+            logger.error(f"Error reading file {file_path}: {e}")
+            return None, None
+        
+        try:
+            from internagent.mas.models.model_factory import ModelFactory
+            
+            # 決定使用的模型提供者和名稱，與 launch_discovery.py 的邏輯一致
+            # 1. 優先從 experiment.model（但在 codeview 中沒有，所以用 codeview 配置）
+            # 2. 從 codeview.model_name
+            # 3. 從 models.default_provider 的 model_name
+            # 4. 後備值
+            
+            model_provider = codeview_config.get("model_provider", "default")
+            if model_provider == "default":
+                default_provider = model_config.get("default_provider", "azure")
+                if default_provider in model_config:
+                    provider_config = model_config[default_provider].copy()
+                    provider_config["provider"] = default_provider
+                    provider_config["default_provider"] = default_provider
+                else:
+                    # 後備：使用 azure
+                    provider_config = {
+                        "provider": "azure",
+                        "default_provider": "azure",
+                        "model_name": "gpt-4.1-mini"  # 與 launch_discovery.py 一致的後備值
+                    }
+            else:
+                if model_provider in model_config:
+                    provider_config = model_config[model_provider].copy()
+                    provider_config["provider"] = model_provider
+                    provider_config["default_provider"] = model_config.get("default_provider", "azure")
+                else:
+                    logger.error(f"Provider '{model_provider}' not found in config, using fallback")
+                    provider_config = {
+                        "provider": "azure",
+                        "default_provider": "azure",
+                        "model_name": "gpt-4.1-mini"
+                    }
+            
+            # 使用 codeview_config 中的 model_name 覆蓋（如果有的話）
+            if "model_name" in codeview_config:
+                provider_config["model_name"] = codeview_config["model_name"]
+            
+            # 使用 llm_settings 覆蓋溫度等設定
+            if hasattr(llm_settings, 'temperature'):
+                provider_config["temperature"] = llm_settings.temperature
+            if hasattr(llm_settings, 'max_tokens'):
+                provider_config["max_tokens"] = llm_settings.max_tokens
+            
+            # 建立模型
+            model = ModelFactory.create_model(provider_config)
+            logger.info(f"Using model provider: {provider_config.get('provider')} with model: {provider_config.get('model_name')}")
+            
+            # 使用模型的 generate 方法（async）
+            # 注意：由於在 multiprocessing Pool 中使用，需要建立新的事件循環
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                results = loop.run_until_complete(
+                    model.generate(
+                        prompt=CODE_VIEW_PROMPT.format(code=code),
+                        system_prompt=CODE_VIEW_SYS_PROMPT,
+                        temperature=provider_config.get("temperature", 0.6),
+                        max_tokens=provider_config.get("max_tokens", 3000)
+                    )
+                )
+            finally:
+                loop.close()
+            
             return (dict_path, results)
-        except:
+            
+        except Exception as e:
+            logger.error(f"Error during generate doc for file {file_path}: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
             return None, None
             
     def save_to_json(self, response, dict_path, repo_structure):
@@ -426,80 +441,105 @@ A list of key files that are critical to understanding or implementing the funct
 
 """
 
+def get_repo_summary_with_config(repo_file_tree, llm_settings, config: Dict[str, Any]):
+    """
+    使用配置檔產生程式庫摘要。
+    
+    Args:
+        repo_file_tree: 程式庫檔案樹
+        llm_settings: LLM 設定
+        config: 配置字典（包含 models 和 codeview 配置）
+    """
+    try:
+        from internagent.mas.models.model_factory import ModelFactory
+        
+        codeview_config = config.get("codeview", {})
+        model_config = config.get("models", {})
+        
+        # 決定使用哪個提供者，與 launch_discovery.py 的邏輯一致
+        model_provider = codeview_config.get("model_provider", "default")
+        if model_provider == "default":
+            default_provider = model_config.get("default_provider", "azure")
+            if default_provider in model_config:
+                provider_config = model_config[default_provider].copy()
+                provider_config["provider"] = default_provider
+                provider_config["default_provider"] = default_provider
+            else:
+                # 後備：使用 azure
+                provider_config = {
+                    "provider": "azure",
+                    "default_provider": "azure",
+                    "model_name": "gpt-4.1-mini"
+                }
+        else:
+            if model_provider in model_config:
+                provider_config = model_config[model_provider].copy()
+                provider_config["provider"] = model_provider
+                provider_config["default_provider"] = model_config.get("default_provider", "azure")
+            else:
+                logger.error(f"Provider '{model_provider}' not found in config, using fallback")
+                provider_config = {
+                    "provider": "azure",
+                    "default_provider": "azure",
+                    "model_name": "gpt-4.1-mini"
+                }
+        
+        # 使用 codeview_config 中的 model_name（如果有的話）
+        if "model_name" in codeview_config:
+            provider_config["model_name"] = codeview_config["model_name"]
+        
+        # 使用 llm_settings 覆蓋
+        if hasattr(llm_settings, 'temperature'):
+            provider_config["temperature"] = llm_settings.temperature
+        if hasattr(llm_settings, 'max_tokens'):
+            provider_config["max_tokens"] = llm_settings.max_tokens
+        
+        # 建立模型
+        model = ModelFactory.create_model(provider_config)
+        logger.info(f"Using model provider: {provider_config.get('provider')} with model: {provider_config.get('model_name')}")
+        
+        # 使用模型的 generate 方法
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                model.generate(
+                    prompt=REPO_SUMMARY_PROMPT.format(repo_file_tree=repo_file_tree),
+                    system_prompt=REPO_SUMMARY_SYS_PROMPT,
+                    temperature=provider_config.get("temperature", 0.6),
+                    max_tokens=provider_config.get("max_tokens", 3000)
+                )
+            )
+            return result
+        finally:
+            loop.close()
+            
+    except Exception as e:
+        logger.error(f"Error during generate summary for repo: {e}")
+        import traceback
+        logger.debug(traceback.format_exc())
+        return ""
+
+
 def get_repo_summary(client_model, repo_file_tree, llm_settings):
-    if client_model.lower().startswith('gpt'):
-        try: 
-            import openai
-            print(f"Using OpenAI API with model {client_model}")
-            client = openai.OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-            response = client.chat.completions.create(
-                model=client_model,
-                messages=[
-                    {"role": "system", "content": REPO_SUMMARY_SYS_PROMPT},
-                    {"role": "user", "content": REPO_SUMMARY_PROMPT.format(repo_file_tree=repo_file_tree)}
-                ],
-                temperature=llm_settings.temperature,
-                max_tokens=llm_settings.max_tokens
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error during generate summary for repo using {client_model}.\n{e}")
-
-    elif client_model.lower().startswith('claude'):
-        try: 
-            import anthropic
-            print(f"Using Anthropic API with model {client_model}")
-            client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-            response = client.completions.create(
-                model=client_model,
-                system=REPO_SUMMARY_SYS_PROMPT,
-                messages=[
-                    {"role": "user", "content": REPO_SUMMARY_PROMPT.format(repo_file_tree=repo_file_tree)}
-                ],
-                temperature=llm_settings.temperature,
-                max_tokens_to_sample=llm_settings.max_tokens
-            )
-            return response.completions[0].text
-        except Exception as e:
-            print(f"Error during generate summary for repo using {client_model}.\n{e}")
-
-    elif client_model.lower().startswith('deepseek'):
-        try:
-            import openai
-            print(f"Using DeepSeek model: {llm_settings.model}")
-            client_model = llm_settings.model
-            client = openai.OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url=os.environ.get("API_BASE"))
-            response = client.chat.completions.create(
-                model=client_model,
-                messages=[
-                    {"role": "system", "content": REPO_SUMMARY_SYS_PROMPT},
-                    {"role": "user", "content": REPO_SUMMARY_PROMPT.format(repo_file_tree=repo_file_tree)}
-                ],
-                temperature=llm_settings.temperature,
-                max_tokens=llm_settings.max_tokens
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error during generate summary for repo using {client_model}.\n{e}")
-
-    elif client_model.lower().startswith('intern'):
-        try:
-            import openai
-            print(f"Using InternS1 model: {llm_settings.model}")
-            client_model = llm_settings.model
-            client = openai.OpenAI(api_key=os.environ.get("INS1_API_KEY"), base_url=os.environ.get("INS1_API_BASE_URL"))
-            response = client.chat.completions.create(
-                model=client_model,
-                messages=[
-                    {"role": "system", "content": REPO_SUMMARY_SYS_PROMPT},
-                    {"role": "user", "content": REPO_SUMMARY_PROMPT.format(repo_file_tree=repo_file_tree)}
-                ],
-                temperature=llm_settings.temperature,
-                max_tokens=llm_settings.max_tokens
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            print(f"Error during generate summary for repo using {client_model}.\n{e}")
+    """
+    向後相容的函數，保留原有 API。
+    使用配置檔的新實作：get_repo_summary_with_config()
+    """
+    # 嘗試建立基本配置（向後相容）
+    config = {
+        "models": {
+            "default_provider": "azure",
+            "azure": {
+                "model_name": client_model,
+            }
+        },
+        "codeview": {
+            "model_provider": "default",
+            "model_name": client_model,
+        }
+    }
+    return get_repo_summary_with_config(repo_file_tree, llm_settings, config)
 
 def extract_from_repo_summary(repo_summary):
     pattern_summary = r'<code_repo_func>([\s\S]*?)</code_repo_func>'
@@ -517,13 +557,54 @@ def extract_from_repo_summary(repo_summary):
     return summary, key_files
 
 
-def get_repo_structure(model, project_path, output_dir, output_name, ignore_list=None, provider="agent"):
+def get_repo_structure(project_path, output_dir, output_name, ignore_list=None, provider="agent", config: Optional[Dict[str, Any]] = None, model_name: Optional[str] = None):
+    """
+    取得並產生程式庫結構文檔。
+    
+    Args:
+        project_path: 專案路徑
+        output_dir: 輸出目錄
+        output_name: 輸出檔名
+        ignore_list: 忽略清單
+        provider: 提供者類型 ("agent" 或 "user")
+        config: 配置字典（包含 models 和 codeview 配置）
+        model_name: 模型名稱（保留向後相容，但優先使用 config）
+    """
+    # 如果沒有提供 config，嘗試建立基本配置
+    if config is None:
+        # 嘗試從環境變數或預設值建立配置
+        config = {
+            "models": {
+                "default_provider": "azure",
+                "azure": {
+                    "model_name": model_name or "gpt-4.1-mini",
+                }
+            },
+            "codeview": {
+                "model_provider": "default",
+            }
+        }
+    
+    # 使用 codeview 配置中的 model_name，或使用傳入的 model_name
+    codeview_config = config.get("codeview", {})
+    if model_name and "model_name" not in codeview_config:
+        codeview_config["model_name"] = model_name
+    
+    # 決定使用的 model_name（用於 SettingManager，保持向後相容）
+    # 優先順序：codeview.model_name > model_name 參數 > 後備值
+    final_model_name = (
+        codeview_config.get("model_name") or
+        model_name or
+        config.get("models", {}).get("default_provider", "azure") or
+        "gpt-4.1-mini"
+    )
+    
     setting_manager = SettingManager(
         project_path=project_path,
         output_dir=output_dir,
         output_name=output_name,
         ignore_list=ignore_list,
-        model=model,
+        model=final_model_name,
     )
     local_modules = get_local_modules(setting_manager.project_settings.project_path)
     repo_structure_dict = extract_repo_structure(
@@ -532,11 +613,12 @@ def get_repo_structure(model, project_path, output_dir, output_name, ignore_list
         local_modules=local_modules
     )
     print(repo_structure_dict)
-    repo_viewer = RepoViewer(setting_manager, repo_structure_dict)
+    repo_viewer = RepoViewer(setting_manager, repo_structure_dict, config)
     repo_viewer.generate_docs()
     if provider == "user":
         repo_description_tree = get_file_description_tree(repo_structure_dict)
-        repo_summary = get_repo_summary(setting_manager.chat_settings.model, repo_description_tree, setting_manager.chat_settings)
+        # 使用配置來產生摘要
+        repo_summary = get_repo_summary_with_config(repo_description_tree, setting_manager.chat_settings, config)
         summary, key_files = extract_from_repo_summary(repo_summary)
         with open(os.path.join(setting_manager.project_settings.output_dir, setting_manager.project_settings.output_name), 'r') as f:
             repo_structure = json.load(f)

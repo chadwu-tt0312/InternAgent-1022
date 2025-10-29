@@ -291,7 +291,9 @@ def main():
         'skip_idea_generation': args.skip_idea_generation,
         'model': (
             config.get("experiment", {}).get("model") or  # Config file
-            "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            config.get("models", {}).get("default_provider", "azure") or
+            "azure/gpt-4.1-mini"  # 與系統配置一致的預設值
         ),
         'total_ideas': len(results),
         'successful': successful,

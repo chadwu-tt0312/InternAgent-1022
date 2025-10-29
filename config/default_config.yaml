@@ -5,13 +5,26 @@ version: "1.0.0"
 
 # Model Providers Configuration
 models:
-  default_provider: "openai"
+  default_provider: "azure"
 
   openai:
     model_name: "gpt-4o-mini"
     api_key: ""  # Set via environment variable OPENAI_API_KEY
     max_tokens: 4096
-    temperature: 0.7
+    temperature: 0.2
+
+  azure:
+    model_name: "gpt-4o-mini"
+    api_key: ""  # Set via environment variable AZURE_OPENAI_KEY
+    api_base: ""  # Set via environment variable AZURE_OPENAI_ENDPOINT
+    max_tokens: 4096
+    temperature: 0.2
+# 或在這裡指定模型名稱
+
+# CodeView Configuration
+codeview:
+  model_provider: "default"
+  model_name: "gpt-4.1-mini"
 
 # Memory Configuration
 memory:
@@ -23,7 +36,7 @@ agents:
   # Idea Generation Agent
   generation:
     model_provider: "default"
-    generation_count: 5
+    generation_count: 3
     creativity: 0.7
     do_survey: false
 
@@ -39,13 +52,13 @@ agents:
 
   # Method Development Agent
   method_development:
-    model_provider: "openai"
-    model_name: "gpt-4"
+    model_provider: "azure"
+    # model_name: "gpt-4"
 
   # Refinement Agent
   refinement:
-    model_provider: "openai"
-    model_name: "gpt-4"
+    model_provider: "azure"
+    # model_name: "gpt-4"
 
   # Ranking Agent
   ranking:

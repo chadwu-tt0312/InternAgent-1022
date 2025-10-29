@@ -1,3 +1,4 @@
+import os
 import os.path as osp
 import sys
 import json
@@ -249,10 +250,28 @@ class ExperimentRunner:
                 chat_history_file=osp.join(folder_name, f"{idea_name}_aider.txt")
             )
             # Get experiment model from config file
-            experiment_model = (
-                self.config.get("experiment", {}).get("model") or  # Config file
-                "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
-            )
+            # aider/litellm requires format: "provider/model_name" (e.g., "azure/gpt-4o-mini")
+            experiment_model = self.config.get("experiment", {}).get("model")
+            if not experiment_model:
+                # Build model string from default_provider and model_name
+                default_provider = self.config.get("models", {}).get("default_provider", "azure")
+                provider_config = self.config.get("models", {}).get(default_provider, {})
+                model_name = provider_config.get("model_name", "gpt-4.1-mini")
+                experiment_model = f"{default_provider}/{model_name}"
+            
+            # Setup environment variables for litellm (aider uses litellm internally)
+            # litellm expects AZURE_API_KEY and AZURE_API_BASE, not AZURE_OPENAI_KEY/ENDPOINT
+            if experiment_model.startswith("azure/"):
+                if os.environ.get("AZURE_OPENAI_KEY") and not os.environ.get("AZURE_API_KEY"):
+                    os.environ["AZURE_API_KEY"] = os.environ["AZURE_OPENAI_KEY"]
+                if os.environ.get("AZURE_OPENAI_ENDPOINT") and not os.environ.get("AZURE_API_BASE"):
+                    # litellm expects the base endpoint (without /openai/deployments/...)
+                    endpoint = os.environ["AZURE_OPENAI_ENDPOINT"]
+                    # Ensure it ends with / if it's a base URL
+                    if endpoint and not endpoint.endswith("/"):
+                        endpoint = endpoint.rstrip("/")
+                    os.environ["AZURE_API_BASE"] = endpoint
+            
             self.logger.info(f"Using experiment model: {experiment_model}")
             main_model = Model(experiment_model)
             coder = Coder.create(
