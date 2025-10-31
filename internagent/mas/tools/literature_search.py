@@ -9,6 +9,7 @@ import os
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
@@ -150,7 +151,10 @@ class LiteratureSearch:
     def __init__(self, 
                 email: str, 
                 api_keys: Optional[Dict[str, str]] = None,
-                citation_manager: Optional[CitationManager] = None):
+                citation_manager: Optional[CitationManager] = None,
+                pubmed_max_retries: int = 5,
+                pubmed_retry_delay: float = 5.0,
+                pubmed_rate_limit_delay: float = 0.34):
         """
         Initialize the literature search tool.
         
@@ -158,10 +162,16 @@ class LiteratureSearch:
             email: Email for API access (required for PubMed)
             api_keys: Dictionary of API keys for different sources
             citation_manager: Citation manager to use
+            pubmed_max_retries: Maximum number of retries for PubMed API calls
+            pubmed_retry_delay: Initial delay between retries (seconds), will use exponential backoff
+            pubmed_rate_limit_delay: Delay between requests to respect PubMed rate limit (3 requests/sec = ~0.34s)
         """
         self.email = email
         self.api_keys = api_keys or {}
         self.citation_manager = citation_manager or CitationManager()
+        
+        # Get User-Agent from environment variable if set
+        self.user_agent = os.getenv("USER_AGENT")
         
         # Default search parameters
         self.default_max_results = 10
@@ -170,6 +180,105 @@ class LiteratureSearch:
         # Cache for search results
         self._cache = {}
         
+        # PubMed API retry configuration
+        self.pubmed_max_retries = pubmed_max_retries
+        self.pubmed_retry_delay = pubmed_retry_delay
+        self.pubmed_rate_limit_delay = pubmed_rate_limit_delay
+        
+        # Track last PubMed request time for rate limiting
+        self._last_pubmed_request = 0.0
+        # Lock to ensure thread-safe rate limiting for concurrent requests
+        self._pubmed_rate_limit_lock = asyncio.Lock()
+    
+    async def _enforce_pubmed_rate_limit(self):
+        """
+        Enforce PubMed API rate limit (max 3 requests per second).
+        Waits if necessary to ensure we don't exceed the limit.
+        
+        This method is thread-safe and handles concurrent requests properly.
+        """
+        async with self._pubmed_rate_limit_lock:
+            current_time = time.time()
+            time_since_last_request = current_time - self._last_pubmed_request
+            
+            if time_since_last_request < self.pubmed_rate_limit_delay:
+                wait_time = self.pubmed_rate_limit_delay - time_since_last_request
+                await asyncio.sleep(wait_time)
+            
+            self._last_pubmed_request = time.time()
+    
+    async def _pubmed_request_with_retry(self, session: aiohttp.ClientSession, 
+                                         url: str, params: Dict[str, Any], 
+                                         headers: Dict[str, str],
+                                         operation: str = "request") -> Optional[Dict[str, Any]]:
+        """
+        Make a PubMed API request with exponential backoff retry logic.
+        
+        Args:
+            session: aiohttp ClientSession
+            url: Request URL
+            params: Request parameters
+            headers: Request headers
+            operation: Operation name for logging (e.g., "search", "fetch")
+            
+        Returns:
+            Dictionary with 'content_type' and 'data' if successful, None if all retries exhausted.
+            For JSON responses, 'data' is a dict. For XML/text responses, 'data' is a string.
+        """
+        retry_count = 0
+        delay = self.pubmed_retry_delay
+        
+        while retry_count < self.pubmed_max_retries:
+            try:
+                # Enforce rate limit before each request
+                await self._enforce_pubmed_rate_limit()
+                
+                async with session.get(url, params=params, headers=headers) as response:
+                    # Success
+                    if response.status == 200:
+                        # Read the content while response is still open
+                        content_type = response.content_type
+                        if 'application/json' in content_type:
+                            data = await response.json()
+                        else:
+                            data = await response.text()
+                        return {'content_type': content_type, 'data': data}
+                    
+                    # Rate limit error (429) - retry with backoff
+                    if response.status == 429:
+                        retry_after = None
+                        if 'Retry-After' in response.headers:
+                            try:
+                                retry_after = int(response.headers['Retry-After'])
+                                logger.warning(f"PubMed {operation} rate limited (429). Retry-After: {retry_after}s. Retrying in {delay}s...")
+                            except ValueError:
+                                logger.warning(f"PubMed {operation} rate limited (429). Retrying in {delay}s...")
+                        
+                        if retry_after:
+                            await asyncio.sleep(retry_after)
+                        else:
+                            await asyncio.sleep(delay)
+                        
+                        delay *= 2  # Exponential backoff
+                        retry_count += 1
+                        continue
+                    
+                    # Other HTTP errors - log and retry
+                    logger.warning(f"PubMed {operation} error: {response.status}. Retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                    retry_count += 1
+                    
+            except Exception as e:
+                logger.warning(f"PubMed {operation} exception: {str(e)}. Retrying in {delay}s...")
+                await asyncio.sleep(delay)
+                delay *= 2  # Exponential backoff
+                retry_count += 1
+        
+        # All retries exhausted
+        logger.error(f"PubMed {operation} failed after {self.pubmed_max_retries} retries")
+        return None
+        
     async def search_pubmed(self,
                           query: str,
                           max_results: int = 10,
@@ -177,6 +286,9 @@ class LiteratureSearch:
                           **kwargs) -> List[PaperMetadata]:
         """
         Search PubMed for papers matching the query.
+        
+        Implements rate limiting and automatic retry with exponential backoff
+        to handle PubMed API limitations (max 3 requests/second).
         
         Args:
             query: Search query
@@ -211,49 +323,65 @@ class LiteratureSearch:
             "tool": "search_tool"
         }
         
+        # Prepare headers with User-Agent if set
+        headers = {}
+        if self.user_agent:
+            headers["User-Agent"] = self.user_agent
+        
         try:
-            async with aiohttp.ClientSession() as session:
-                # First, search for matching PMIDs
-                async with session.get(search_url, params=search_params) as response:
-                    if response.status != 200:
-                        logger.error(f"PubMed search error: {response.status}")
-                        return []
-                        
-                    search_data = await response.json() if response.content_type == 'application/json' else {}
-                    pmids = search_data.get("esearchresult", {}).get("idlist", [])
+            # ClientSession with proxy support via trust_env (reads HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+            async with aiohttp.ClientSession(trust_env=True) as session:
+                # First, search for matching PMIDs with retry logic
+                search_result = await self._pubmed_request_with_retry(
+                    session, search_url, search_params, headers, "search"
+                )
+                
+                if search_result is None:
+                    logger.error(f"PubMed search failed for query: {query}")
+                    return []
+                
+                # Extract data from result
+                search_data = search_result['data'] if isinstance(search_result['data'], dict) else {}
+                pmids = search_data.get("esearchresult", {}).get("idlist", [])
+                
+                if not pmids:
+                    logger.info(f"No PubMed results found for query: {query}")
+                    return []
+                
+                # Now fetch details for these PMIDs with retry logic
+                fetch_params = {
+                    "db": "pubmed",
+                    "id": ",".join(pmids),
+                    "retmode": "xml",
+                    "email": self.email,
+                    "tool": "search_tool"
+                }
+                
+                fetch_result = await self._pubmed_request_with_retry(
+                    session, fetch_url, fetch_params, headers, "fetch"
+                )
+                
+                if fetch_result is None:
+                    logger.error(f"PubMed fetch failed for query: {query}")
+                    return []
                     
-                    if not pmids:
-                        logger.info(f"No PubMed results found for query: {query}")
-                        return []
+                xml_data = fetch_result['data']
+                papers = self._parse_pubmed_xml(xml_data)
+                
+                # Cache the results
+                self._cache[cache_key] = papers
+                
+                # Add papers to citation manager
+                for paper in papers:
+                    self.citation_manager.add_paper(paper)
                     
-                    # Now fetch details for these PMIDs
-                    fetch_params = {
-                        "db": "pubmed",
-                        "id": ",".join(pmids),
-                        "retmode": "xml",
-                        "email": self.email,
-                        "tool": "search_tool"
-                    }
-                    
-                    async with session.get(fetch_url, params=fetch_params) as fetch_response:
-                        if fetch_response.status != 200:
-                            logger.error(f"PubMed fetch error: {fetch_response.status}")
-                            return []
-                            
-                        xml_data = await fetch_response.text()
-                        papers = self._parse_pubmed_xml(xml_data)
-                        
-                        # Cache the results
-                        self._cache[cache_key] = papers
-                        
-                        # Add papers to citation manager
-                        for paper in papers:
-                            self.citation_manager.add_paper(paper)
-                            
-                        return papers
+                logger.info(f"Successfully retrieved {len(papers)} papers from PubMed for query: {query}")
+                return papers
                         
         except Exception as e:
-            logger.error(f"Error searching PubMed: {str(e)}")
+            logger.error(f"Error search_pubmed(): {str(e)}")
+            import traceback
+            logger.debug(f"PubMed search traceback: {traceback.format_exc()}")
             return []
     
     async def search_arxiv(self, 
@@ -302,11 +430,17 @@ class LiteratureSearch:
             "sortOrder": "descending"
         }
         
+        # Prepare headers with User-Agent if set
+        headers = {}
+        if self.user_agent:
+            headers["User-Agent"] = self.user_agent
+        
         tries = 3
         for attempt in range(tries):
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(search_url, params=search_params) as response:
+                # ClientSession with proxy support via trust_env (reads HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+                async with aiohttp.ClientSession(trust_env=True) as session:
+                    async with session.get(search_url, params=search_params, headers=headers) as response:
                         if response.status != 200:
                             logger.error(f"arXiv search error: {response.status}")
                             if attempt < tries - 1:
@@ -374,8 +508,12 @@ class LiteratureSearch:
             "fields": "title,abstract,authors.name,year,journal.name,url,citationCount,doi"
         }
         
-        # Headers
-        headers = {"x-api-key": api_key} if api_key else {}
+        # Prepare headers with API key and User-Agent if set
+        headers = {}
+        if api_key:
+            headers["x-api-key"] = api_key
+        if self.user_agent:
+            headers["User-Agent"] = self.user_agent
         
         tries = 3
         for attempt in range(tries):
@@ -384,7 +522,8 @@ class LiteratureSearch:
             try:
                 # Rate limit between requests
                 await asyncio.sleep(1)
-                async with aiohttp.ClientSession() as session:
+                # ClientSession with proxy support via trust_env (reads HTTP_PROXY, HTTPS_PROXY, NO_PROXY)
+                async with aiohttp.ClientSession(trust_env=True) as session:
                     async with session.get(search_url, params=search_params, headers=headers) as response:
                         if response.status != 200:
                             logger.error(f"Semantic Scholar search error: {response.status}")

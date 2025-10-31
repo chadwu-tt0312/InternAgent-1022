@@ -49,7 +49,8 @@ class SurveyAgent(BaseAgent):
         # Load agent-specific configuration
         self.max_papers = config.get("max_papers", 5)
         self.search_depth = config.get("search_depth", "moderate")  # shallow, moderate, deep
-        self.sources = config.get("sources", ["pubmed", "arxiv", "semantic_scholar"])
+        # Default to arxiv and pubmed only (semantic_scholar has frequent rate limit issues)
+        self.sources = config.get("sources", ["pubmed", "arxiv"])
         
         # Initialize tools
         tools_config = config.get("_global_config", {}).get("tools", {})

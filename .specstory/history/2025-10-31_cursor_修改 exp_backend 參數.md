@@ -1,0 +1,1833 @@
+# 修改 exp_backend 參數
+_Exported on 2025/10/31 at 17:36:26 [GMT+8] from Cursor (2.0.43)_
+
+---
+
+**User**
+
+請協助修改成可以 不帶參數 exp_backend 
+
+---
+
+**Cursor**
+
+
+檢視 `scripts/run_pipeline.sh`，準備修改為可選參數 `exp_backend`。
+
+
+檢查 `launch_discovery.py` 中 `exp_backend` 的定義，確認是否必須：
+
+
+修改腳本，使 `exp_backend` 成為可選參數。由於 `launch_discovery.py` 將其設為必需，一併將其改為可選並提供預設值：
+
+
+```shellscript
+#!/bin/bash
+# Activate virtual environment if it exists
+if [ -d ".venv" ]; then
+    # Check if we're on Windows (Git Bash)
+    if [[ "$OSTYPE" == "msys" ]] || [[ "$OSTYPE" == "cygwin" ]] || [[ -n "$WINDIR" ]]; then
+        source .venv/Scripts/activate
+    else
+        source .venv/bin/activate
+    fi
+fi
+
+# Build command with optional exp_backend parameter
+CMD="uv run launch_discovery.py --task AutoSeg"
+if [ -n "$1" ]; then
+    CMD="$CMD --exp_backend $1"
+fi
+CMD="$CMD --gpus 0,1"
+
+eval $CMD
+
+```
+
+調整 `launch_discovery.py`，將 `exp_backend` 設為可選並提供預設值：
+
+
+```python
+"""
+Launch InternAgent 
+"""
+import os
+import os.path as osp
+import sys
+import json
+import argparse
+import asyncio
+import logging
+import torch
+import yaml
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Import MAS components
+from internagent.stage import IdeaGenerator, ExperimentRunner
+
+load_dotenv()
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+def setup_logging():
+    """Setup logging configuration"""
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = osp.join(log_dir, f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_internagent.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger("InternAgent")
+
+
+# ============================================================================
+# Argument Parser
+# ============================================================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Integrated InternAgent Pipeline: Idea Generation + Experiment Execution"
+    )
+    
+    # ========================================
+    # Task Configuration
+    # ========================================
+    task_group = parser.add_argument_group('Task Configuration')
+    task_group.add_argument(
+        "--task",
+        type=str,
+        default="AutoSeg",
+        help="Task name or path to task directory. If it's a name, will use tasks/{task}; if it's a path, will use it directly"
+    )
+    task_group.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Results output directory (defaults to results/{task_name})"
+    )
+    task_group.add_argument(
+        "--config",
+        type=str,
+        default='config/default_config.yaml',
+        help="Path to configuration file"
+    )
+    
+    # ========================================
+    # Idea Generation Phase
+    # ========================================
+    idea_group = parser.add_argument_group('Idea Generation Phase')
+    idea_group.add_argument(
+        "--skip_idea_generation",
+        action="store_true",
+        help="Skip idea generation and use existing ideas from idea_path"
+    )
+    idea_group.add_argument(
+        "--idea_path",
+        type=str,
+        default=None,
+        help="Path to existing ideas JSON (used when skip_idea_generation=True)"
+    )
+    idea_group.add_argument(
+        "--ref_code_path",
+        type=str,
+        default=None,
+        help="Baseline reference code path (defaults to {task_dir}/experiment.py)"
+    )
+    idea_group.add_argument(
+        "--offline_feedback",
+        type=str,
+        default='config/feedback_global.json',
+        help="Offline feedback file for idea generation"
+    )
+    
+    # ========================================
+    # Experiment Execution Config
+    # ========================================
+    exp_group = parser.add_argument_group('Experiment Execution Phase')
+    exp_group.add_argument(
+        "--exp_backend",
+        type=str,
+        required=False,
+        default="aider",
+        choices=["aider", "openhands"],
+        help="Experiment backend to use (default: aider)"
+    )
+    # Note: Model configuration is handled through config file (experiment.model)
+    exp_group.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs (e.g., '0,1,2')"
+    )
+
+    # Note: OpenHands-specific configuration (mount_paths, uri_prefix) is handled through config file
+    
+    return parser.parse_args()
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+def main():
+    logger = setup_logging()
+    args = parse_arguments()
+    
+    # Setup task directory
+    # If task is a path (contains / or \), use it directly; otherwise use tasks/{task}
+    if '/' in args.task or '\\' in args.task or osp.isdir(args.task):
+        args.task_dir = args.task
+        args.task_name = osp.basename(args.task.rstrip('/\\'))
+    else:
+        args.task_dir = osp.join("tasks", args.task)
+        args.task_name = args.task
+    
+    if not osp.exists(args.task_dir):
+        raise FileNotFoundError(f"Task directory not found: {args.task_dir}")
+    
+    # Setup reference code path
+    if args.ref_code_path is None:
+        args.ref_code_path = osp.join(args.task_dir, "experiment.py")
+    
+    # Setup output directory
+    if args.output_dir is None:
+        args.output_dir = osp.join("results", args.task_name)
+    else:
+        args.output_dir = osp.join("results", args.output_dir)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    logger.info("=" * 80)
+    logger.info("InternAgent Pipeline Started")
+    logger.info(f"Task: {args.task_name}")
+    logger.info(f"Task Directory: {args.task_dir}")
+    logger.info(f"Experiment Backend: {args.exp_backend}")
+    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info("=" * 80)
+    
+    # Step 1: Idea Generation
+    if args.skip_idea_generation:
+        logger.info("Skipping idea generation, loading existing ideas...")
+        if not args.idea_path or not osp.exists(args.idea_path):
+            raise FileNotFoundError(f"Idea path not found: {args.idea_path}")
+        
+        with open(args.idea_path, 'r') as f:
+            ideas_data = json.load(f)
+        
+        # Extract top hypotheses
+        if 'hypotheses' in ideas_data and 'top_hypotheses' in ideas_data:
+            top_ideas = [
+                item for item in ideas_data['hypotheses']
+                if item['id'] in ideas_data['top_hypotheses']
+            ]
+        else:
+            # Assume it's already a list of ideas
+            top_ideas = ideas_data
+        
+        logger.info(f"Loaded {len(top_ideas)} ideas from {args.idea_path}")
+        session_json = args.idea_path
+        
+    else:
+        logger.info("Starting idea generation with MAS...")
+        idea_generator = IdeaGenerator(args, logger)
+        
+        try:
+            top_ideas, session_json = asyncio.run(idea_generator.generate_ideas())
+        except Exception as e:
+            logger.error(f"Idea generation failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Save ideas in standard format
+        ideas_output = osp.join(args.output_dir, "ideas.json")
+        os.makedirs(osp.dirname(ideas_output), exist_ok=True)
+        
+        aligned_ideas = [idea['refined_method_details'] for idea in top_ideas]
+        with open(ideas_output, 'w') as f:
+            json.dump(aligned_ideas, f, indent=4)
+        
+        logger.info(f"Ideas saved to {ideas_output}")
+    
+    # Step 2: Experiment Execution
+    logger.info("=" * 80)
+    logger.info(f"Starting experiment execution with {args.exp_backend} backend")
+    logger.info(f"Number of ideas to test: {len(top_ideas)}")
+    logger.info("=" * 80)
+    
+    # Setup GPU configuration
+    if args.gpus:
+        gpu_ids = [int(gid) for gid in args.gpus.split(',')]
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        logger.info(f"Using GPUs: {gpu_ids}")
+    else:
+        available_gpus = list(range(torch.cuda.device_count()))
+        logger.info(f"Using all available GPUs: {available_gpus}")
+    
+    # Load config for experiment runner
+    config = {}
+    if args.config and osp.exists(args.config):
+        try:
+            with open(args.config, 'r') as f:
+                if args.config.endswith(('.yaml', '.yml')):
+                    config = yaml.safe_load(f)
+                else:
+                    config = json.load(f)
+            logger.info(f"Loaded experiment config from {args.config}")
+        except Exception as e:
+            logger.warning(f"Failed to load experiment config: {e}")
+
+    # Validate backend-specific requirements
+    if args.exp_backend == "openhands":
+        openhands_config = config.get("experiment", {}).get("openhands", {})
+        mount_paths = openhands_config.get("mount_paths", [])
+        uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
+
+        if not mount_paths:
+            logger.warning("No mount paths specified in config for OpenHands backend")
+        else:
+            logger.info(f"OpenHands mount paths: {mount_paths}")
+        logger.info(f"OpenHands URI prefix: {uri_prefix}")
+
+    # Run experiments
+    experiment_runner = ExperimentRunner(args, logger, config)
+    
+    try:
+        results = experiment_runner.run_experiments(
+            base_dir=args.task_dir,
+            results_dir=args.output_dir,
+            ideas=top_ideas
+        )
+    except Exception as e:
+        logger.error(f"Experiment execution failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 3: Summary
+    logger.info("=" * 80)
+    logger.info("InternAgent Run Completed")
+    logger.info("=" * 80)
+    
+    successful = sum(1 for r in results if r['success'])
+    failed = len(results) - successful
+    
+    logger.info(f"Total ideas tested: {len(results)}")
+    logger.info(f"Successful experiments: {successful}")
+    logger.info(f"Failed experiments: {failed}")
+    
+    # Print detailed results
+    logger.info("\nDetailed Results:")
+    for i, result in enumerate(results, 1):
+        status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+        logger.info(f"  {i}. {result['idea_name']}: {status}")
+        if 'error' in result:
+            logger.info(f"     Error: {result['error']}")
+    
+    # Save summary
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'task': args.task_name,
+        'task_dir': args.task_dir,
+        'exp_backend': args.exp_backend,
+        'output_dir': args.output_dir,
+        'ideas_source': session_json if not args.skip_idea_generation else args.idea_path,
+        'skip_idea_generation': args.skip_idea_generation,
+        'model': (
+            config.get("experiment", {}).get("model") or  # Config file
+            # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            config.get("models", {}).get("default_provider", "azure") or
+            "azure/gpt-4o-mini"  # 與系統配置一致的預設值
+        ),
+        'total_ideas': len(results),
+        'successful': successful,
+        'failed': failed,
+        'results': results
+    }
+    
+    summary_path = osp.join(args.output_dir, "discovery_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    logger.info(f"\nSummary saved to {summary_path}")
+    logger.info("=" * 80)
+    logger.info("All done!")
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDiscovery pipeline interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\nFatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+```
+
+已完成修改：
+
+1. **修改 `run_pipeline.sh`**：改為可選參數，若提供第一個參數則作為 `exp_backend`，未提供則不傳遞（使用 Python 腳本的預設值）。
+2. **修改 `launch_discovery.py`**：將 `exp_backend` 設為可選（`required=False`），預設值為 `"aider"`。
+
+現在使用方式：
+- **不帶參數**：`./scripts/run_pipeline.sh` - 使用預設值 `aider`
+- **帶參數**：`./scripts/run_pipeline.sh openhands` - 使用指定的 backend
+
+腳本會自動處理參數傳遞，未提供時會使用 Python 腳本的預設值。
+
+---
+
+**User**
+
+args: Namespace(task='AutoSeg', output_dir=None, config='config/default_config.yaml', skip_idea_generation=False, idea_path=None, ref_code_path=None, offline_feedback='config/feedback_global.json', exp_backend='aider', gpus='0,1')
+
+目前 exp_backend='aider' 。希望改成 run_pipeline.sh 不帶參數時 exp_backend=''
+
+並且當 exp_backend='' 不執行 Experiment 相關功能
+
+---
+
+**Cursor**
+
+
+調整設定：
+1. 不帶參數時，`exp_backend` 預設為空字串 `''`
+2. 當 `exp_backend=''` 時，跳過 Experiment 相關功能
+
+查看 Experiment 的執行位置：
+
+
+檢視完整的參數定義：
+
+
+進行以下修改：
+1. 將 `exp_backend` 預設值改為空字串 `''`
+2. 允許空字串（調整 choices 或移除限制）
+3. 當 `exp_backend=''` 時，跳過 Experiment 執行
+
+
+```python
+"""
+Launch InternAgent 
+"""
+import os
+import os.path as osp
+import sys
+import json
+import argparse
+import asyncio
+import logging
+import torch
+import yaml
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Import MAS components
+from internagent.stage import IdeaGenerator, ExperimentRunner
+
+load_dotenv()
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+def setup_logging():
+    """Setup logging configuration"""
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = osp.join(log_dir, f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_internagent.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger("InternAgent")
+
+
+# ============================================================================
+# Argument Parser
+# ============================================================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Integrated InternAgent Pipeline: Idea Generation + Experiment Execution"
+    )
+    
+    # ========================================
+    # Task Configuration
+    # ========================================
+    task_group = parser.add_argument_group('Task Configuration')
+    task_group.add_argument(
+        "--task",
+        type=str,
+        default="AutoSeg",
+        help="Task name or path to task directory. If it's a name, will use tasks/{task}; if it's a path, will use it directly"
+    )
+    task_group.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Results output directory (defaults to results/{task_name})"
+    )
+    task_group.add_argument(
+        "--config",
+        type=str,
+        default='config/default_config.yaml',
+        help="Path to configuration file"
+    )
+    
+    # ========================================
+    # Idea Generation Phase
+    # ========================================
+    idea_group = parser.add_argument_group('Idea Generation Phase')
+    idea_group.add_argument(
+        "--skip_idea_generation",
+        action="store_true",
+        help="Skip idea generation and use existing ideas from idea_path"
+    )
+    idea_group.add_argument(
+        "--idea_path",
+        type=str,
+        default=None,
+        help="Path to existing ideas JSON (used when skip_idea_generation=True)"
+    )
+    idea_group.add_argument(
+        "--ref_code_path",
+        type=str,
+        default=None,
+        help="Baseline reference code path (defaults to {task_dir}/experiment.py)"
+    )
+    idea_group.add_argument(
+        "--offline_feedback",
+        type=str,
+        default='config/feedback_global.json',
+        help="Offline feedback file for idea generation"
+    )
+    
+    # ========================================
+    # Experiment Execution Config
+    # ========================================
+    exp_group = parser.add_argument_group('Experiment Execution Phase')
+    exp_group.add_argument(
+        "--exp_backend",
+        type=str,
+        required=False,
+        default="",
+        choices=["", "aider", "openhands"],
+        help="Experiment backend to use (default: empty string, skips experiment execution)"
+    )
+    # Note: Model configuration is handled through config file (experiment.model)
+    exp_group.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs (e.g., '0,1,2')"
+    )
+
+    # Note: OpenHands-specific configuration (mount_paths, uri_prefix) is handled through config file
+    
+    return parser.parse_args()
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+def main():
+    logger = setup_logging()
+    args = parse_arguments()
+    print(f"args: {args}")
+    
+    # Setup task directory
+    # If task is a path (contains / or \), use it directly; otherwise use tasks/{task}
+    if '/' in args.task or '\\' in args.task or osp.isdir(args.task):
+        args.task_dir = args.task
+        args.task_name = osp.basename(args.task.rstrip('/\\'))
+    else:
+        args.task_dir = osp.join("tasks", args.task)
+        args.task_name = args.task
+    
+    if not osp.exists(args.task_dir):
+        raise FileNotFoundError(f"Task directory not found: {args.task_dir}")
+    
+    # Setup reference code path
+    if args.ref_code_path is None:
+        args.ref_code_path = osp.join(args.task_dir, "experiment.py")
+    
+    # Setup output directory
+    if args.output_dir is None:
+        args.output_dir = osp.join("results", args.task_name)
+    else:
+        args.output_dir = osp.join("results", args.output_dir)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    logger.info("=" * 80)
+    logger.info("InternAgent Pipeline Started")
+    logger.info(f"Task: {args.task_name}")
+    logger.info(f"Task Directory: {args.task_dir}")
+    logger.info(f"Experiment Backend: {args.exp_backend}")
+    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info("=" * 80)
+    
+    # Step 1: Idea Generation
+    if args.skip_idea_generation:
+        logger.info("Skipping idea generation, loading existing ideas...")
+        if not args.idea_path or not osp.exists(args.idea_path):
+            raise FileNotFoundError(f"Idea path not found: {args.idea_path}")
+        
+        with open(args.idea_path, 'r') as f:
+            ideas_data = json.load(f)
+        
+        # Extract top hypotheses
+        if 'hypotheses' in ideas_data and 'top_hypotheses' in ideas_data:
+            top_ideas = [
+                item for item in ideas_data['hypotheses']
+                if item['id'] in ideas_data['top_hypotheses']
+            ]
+        else:
+            # Assume it's already a list of ideas
+            top_ideas = ideas_data
+        
+        logger.info(f"Loaded {len(top_ideas)} ideas from {args.idea_path}")
+        session_json = args.idea_path
+        
+    else:
+        logger.info("Starting idea generation with MAS...")
+        idea_generator = IdeaGenerator(args, logger)
+        
+        try:
+            top_ideas, session_json = asyncio.run(idea_generator.generate_ideas())
+        except Exception as e:
+            logger.error(f"Idea generation failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Save ideas in standard format
+        ideas_output = osp.join(args.output_dir, "ideas.json")
+        os.makedirs(osp.dirname(ideas_output), exist_ok=True)
+        
+        aligned_ideas = [idea['refined_method_details'] for idea in top_ideas]
+        with open(ideas_output, 'w') as f:
+            json.dump(aligned_ideas, f, indent=4)
+        
+        logger.info(f"Ideas saved to {ideas_output}")
+    
+    # Step 2: Experiment Execution
+    logger.info("=" * 80)
+    logger.info(f"Starting experiment execution with {args.exp_backend} backend")
+    logger.info(f"Number of ideas to test: {len(top_ideas)}")
+    logger.info("=" * 80)
+    
+    # Setup GPU configuration
+    if args.gpus:
+        gpu_ids = [int(gid) for gid in args.gpus.split(',')]
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+        logger.info(f"Using GPUs: {gpu_ids}")
+    else:
+        available_gpus = list(range(torch.cuda.device_count()))
+        logger.info(f"Using all available GPUs: {available_gpus}")
+    
+    # Load config for experiment runner
+    config = {}
+    if args.config and osp.exists(args.config):
+        try:
+            with open(args.config, 'r') as f:
+                if args.config.endswith(('.yaml', '.yml')):
+                    config = yaml.safe_load(f)
+                else:
+                    config = json.load(f)
+            logger.info(f"Loaded experiment config from {args.config}")
+        except Exception as e:
+            logger.warning(f"Failed to load experiment config: {e}")
+
+    # Validate backend-specific requirements
+    if args.exp_backend == "openhands":
+        openhands_config = config.get("experiment", {}).get("openhands", {})
+        mount_paths = openhands_config.get("mount_paths", [])
+        uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
+
+        if not mount_paths:
+            logger.warning("No mount paths specified in config for OpenHands backend")
+        else:
+            logger.info(f"OpenHands mount paths: {mount_paths}")
+        logger.info(f"OpenHands URI prefix: {uri_prefix}")
+
+    # Run experiments
+    experiment_runner = ExperimentRunner(args, logger, config)
+    
+    try:
+        results = experiment_runner.run_experiments(
+            base_dir=args.task_dir,
+            results_dir=args.output_dir,
+            ideas=top_ideas
+        )
+    except Exception as e:
+        logger.error(f"Experiment execution failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    
+    # Step 3: Summary
+    logger.info("=" * 80)
+    logger.info("InternAgent Run Completed")
+    logger.info("=" * 80)
+    
+    successful = sum(1 for r in results if r['success'])
+    failed = len(results) - successful
+    
+    logger.info(f"Total ideas tested: {len(results)}")
+    logger.info(f"Successful experiments: {successful}")
+    logger.info(f"Failed experiments: {failed}")
+    
+    # Print detailed results
+    logger.info("\nDetailed Results:")
+    for i, result in enumerate(results, 1):
+        status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+        logger.info(f"  {i}. {result['idea_name']}: {status}")
+        if 'error' in result:
+            logger.info(f"     Error: {result['error']}")
+    
+    # Save summary
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'task': args.task_name,
+        'task_dir': args.task_dir,
+        'exp_backend': args.exp_backend,
+        'output_dir': args.output_dir,
+        'ideas_source': session_json if not args.skip_idea_generation else args.idea_path,
+        'skip_idea_generation': args.skip_idea_generation,
+        'model': (
+            config.get("experiment", {}).get("model") or  # Config file
+            # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            config.get("models", {}).get("default_provider", "azure") or
+            "azure/gpt-4o-mini"  # 與系統配置一致的預設值
+        ),
+        'total_ideas': len(results),
+        'successful': successful,
+        'failed': failed,
+        'results': results
+    }
+    
+    summary_path = osp.join(args.output_dir, "discovery_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    logger.info(f"\nSummary saved to {summary_path}")
+    logger.info("=" * 80)
+    logger.info("All done!")
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDiscovery pipeline interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\nFatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+```
+
+```python
+"""
+Launch InternAgent 
+"""
+import os
+import os.path as osp
+import sys
+import json
+import argparse
+import asyncio
+import logging
+import torch
+import yaml
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Import MAS components
+from internagent.stage import IdeaGenerator, ExperimentRunner
+
+load_dotenv()
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+def setup_logging():
+    """Setup logging configuration"""
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = osp.join(log_dir, f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_internagent.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger("InternAgent")
+
+
+# ============================================================================
+# Argument Parser
+# ============================================================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Integrated InternAgent Pipeline: Idea Generation + Experiment Execution"
+    )
+    
+    # ========================================
+    # Task Configuration
+    # ========================================
+    task_group = parser.add_argument_group('Task Configuration')
+    task_group.add_argument(
+        "--task",
+        type=str,
+        default="AutoSeg",
+        help="Task name or path to task directory. If it's a name, will use tasks/{task}; if it's a path, will use it directly"
+    )
+    task_group.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Results output directory (defaults to results/{task_name})"
+    )
+    task_group.add_argument(
+        "--config",
+        type=str,
+        default='config/default_config.yaml',
+        help="Path to configuration file"
+    )
+    
+    # ========================================
+    # Idea Generation Phase
+    # ========================================
+    idea_group = parser.add_argument_group('Idea Generation Phase')
+    idea_group.add_argument(
+        "--skip_idea_generation",
+        action="store_true",
+        help="Skip idea generation and use existing ideas from idea_path"
+    )
+    idea_group.add_argument(
+        "--idea_path",
+        type=str,
+        default=None,
+        help="Path to existing ideas JSON (used when skip_idea_generation=True)"
+    )
+    idea_group.add_argument(
+        "--ref_code_path",
+        type=str,
+        default=None,
+        help="Baseline reference code path (defaults to {task_dir}/experiment.py)"
+    )
+    idea_group.add_argument(
+        "--offline_feedback",
+        type=str,
+        default='config/feedback_global.json',
+        help="Offline feedback file for idea generation"
+    )
+    
+    # ========================================
+    # Experiment Execution Config
+    # ========================================
+    exp_group = parser.add_argument_group('Experiment Execution Phase')
+    exp_group.add_argument(
+        "--exp_backend",
+        type=str,
+        required=False,
+        default="",
+        choices=["", "aider", "openhands"],
+        help="Experiment backend to use (default: empty string, skips experiment execution)"
+    )
+    # Note: Model configuration is handled through config file (experiment.model)
+    exp_group.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs (e.g., '0,1,2')"
+    )
+
+    # Note: OpenHands-specific configuration (mount_paths, uri_prefix) is handled through config file
+    
+    return parser.parse_args()
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+def main():
+    logger = setup_logging()
+    args = parse_arguments()
+    print(f"args: {args}")
+    
+    # Setup task directory
+    # If task is a path (contains / or \), use it directly; otherwise use tasks/{task}
+    if '/' in args.task or '\\' in args.task or osp.isdir(args.task):
+        args.task_dir = args.task
+        args.task_name = osp.basename(args.task.rstrip('/\\'))
+    else:
+        args.task_dir = osp.join("tasks", args.task)
+        args.task_name = args.task
+    
+    if not osp.exists(args.task_dir):
+        raise FileNotFoundError(f"Task directory not found: {args.task_dir}")
+    
+    # Setup reference code path
+    if args.ref_code_path is None:
+        args.ref_code_path = osp.join(args.task_dir, "experiment.py")
+    
+    # Setup output directory
+    if args.output_dir is None:
+        args.output_dir = osp.join("results", args.task_name)
+    else:
+        args.output_dir = osp.join("results", args.output_dir)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    logger.info("=" * 80)
+    logger.info("InternAgent Pipeline Started")
+    logger.info(f"Task: {args.task_name}")
+    logger.info(f"Task Directory: {args.task_dir}")
+    logger.info(f"Experiment Backend: {args.exp_backend}")
+    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info("=" * 80)
+    
+    # Step 1: Idea Generation
+    if args.skip_idea_generation:
+        logger.info("Skipping idea generation, loading existing ideas...")
+        if not args.idea_path or not osp.exists(args.idea_path):
+            raise FileNotFoundError(f"Idea path not found: {args.idea_path}")
+        
+        with open(args.idea_path, 'r') as f:
+            ideas_data = json.load(f)
+        
+        # Extract top hypotheses
+        if 'hypotheses' in ideas_data and 'top_hypotheses' in ideas_data:
+            top_ideas = [
+                item for item in ideas_data['hypotheses']
+                if item['id'] in ideas_data['top_hypotheses']
+            ]
+        else:
+            # Assume it's already a list of ideas
+            top_ideas = ideas_data
+        
+        logger.info(f"Loaded {len(top_ideas)} ideas from {args.idea_path}")
+        session_json = args.idea_path
+        
+    else:
+        logger.info("Starting idea generation with MAS...")
+        idea_generator = IdeaGenerator(args, logger)
+        
+        try:
+            top_ideas, session_json = asyncio.run(idea_generator.generate_ideas())
+        except Exception as e:
+            logger.error(f"Idea generation failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Save ideas in standard format
+        ideas_output = osp.join(args.output_dir, "ideas.json")
+        os.makedirs(osp.dirname(ideas_output), exist_ok=True)
+        
+        aligned_ideas = [idea['refined_method_details'] for idea in top_ideas]
+        with open(ideas_output, 'w') as f:
+            json.dump(aligned_ideas, f, indent=4)
+        
+        logger.info(f"Ideas saved to {ideas_output}")
+    
+    # Step 2: Experiment Execution
+    if args.exp_backend:
+        logger.info("=" * 80)
+        logger.info(f"Starting experiment execution with {args.exp_backend} backend")
+        logger.info(f"Number of ideas to test: {len(top_ideas)}")
+        logger.info("=" * 80)
+        
+        # Setup GPU configuration
+        if args.gpus:
+            gpu_ids = [int(gid) for gid in args.gpus.split(',')]
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+            logger.info(f"Using GPUs: {gpu_ids}")
+        else:
+            available_gpus = list(range(torch.cuda.device_count()))
+            logger.info(f"Using all available GPUs: {available_gpus}")
+        
+        # Load config for experiment runner
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+                logger.info(f"Loaded experiment config from {args.config}")
+            except Exception as e:
+                logger.warning(f"Failed to load experiment config: {e}")
+
+        # Validate backend-specific requirements
+        if args.exp_backend == "openhands":
+            openhands_config = config.get("experiment", {}).get("openhands", {})
+            mount_paths = openhands_config.get("mount_paths", [])
+            uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
+
+            if not mount_paths:
+                logger.warning("No mount paths specified in config for OpenHands backend")
+            else:
+                logger.info(f"OpenHands mount paths: {mount_paths}")
+            logger.info(f"OpenHands URI prefix: {uri_prefix}")
+
+        # Run experiments
+        experiment_runner = ExperimentRunner(args, logger, config)
+        
+        try:
+            results = experiment_runner.run_experiments(
+                base_dir=args.task_dir,
+                results_dir=args.output_dir,
+                ideas=top_ideas
+            )
+        except Exception as e:
+            logger.error(f"Experiment execution failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Step 3: Summary
+        logger.info("=" * 80)
+        logger.info("InternAgent Run Completed")
+        logger.info("=" * 80)
+        
+        successful = sum(1 for r in results if r['success'])
+        failed = len(results) - successful
+        
+        logger.info(f"Total ideas tested: {len(results)}")
+        logger.info(f"Successful experiments: {successful}")
+        logger.info(f"Failed experiments: {failed}")
+        
+        # Print detailed results
+        logger.info("\nDetailed Results:")
+        for i, result in enumerate(results, 1):
+            status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+            logger.info(f"  {i}. {result['idea_name']}: {status}")
+            if 'error' in result:
+                logger.info(f"     Error: {result['error']}")
+    else:
+        logger.info("=" * 80)
+        logger.info("Skipping experiment execution (exp_backend is empty)")
+        logger.info("=" * 80)
+        results = []
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+            except Exception as e:
+                pass
+    
+    # Save summary
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'task': args.task_name,
+        'task_dir': args.task_dir,
+        'exp_backend': args.exp_backend,
+        'output_dir': args.output_dir,
+        'ideas_source': session_json if not args.skip_idea_generation else args.idea_path,
+        'skip_idea_generation': args.skip_idea_generation,
+        'model': (
+            config.get("experiment", {}).get("model") or  # Config file
+            # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            config.get("models", {}).get("default_provider", "azure") or
+            "azure/gpt-4o-mini"  # 與系統配置一致的預設值
+        ),
+        'total_ideas': len(results),
+        'successful': len(results) - (len(results) - sum(1 for r in results if r.get('success', False))) if results else 0,
+        'failed': len(results) - (len(results) - sum(1 for r in results if r.get('success', False))) if results else 0,
+        'results': results
+    }
+    
+    summary_path = osp.join(args.output_dir, "discovery_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    logger.info(f"\nSummary saved to {summary_path}")
+    logger.info("=" * 80)
+    logger.info("All done!")
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDiscovery pipeline interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\nFatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+```
+
+修正 summary 中的 successful 和 failed 計算邏輯：
+
+
+```python
+"""
+Launch InternAgent 
+"""
+import os
+import os.path as osp
+import sys
+import json
+import argparse
+import asyncio
+import logging
+import torch
+import yaml
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Import MAS components
+from internagent.stage import IdeaGenerator, ExperimentRunner
+
+load_dotenv()
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+def setup_logging():
+    """Setup logging configuration"""
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = osp.join(log_dir, f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_internagent.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger("InternAgent")
+
+
+# ============================================================================
+# Argument Parser
+# ============================================================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Integrated InternAgent Pipeline: Idea Generation + Experiment Execution"
+    )
+    
+    # ========================================
+    # Task Configuration
+    # ========================================
+    task_group = parser.add_argument_group('Task Configuration')
+    task_group.add_argument(
+        "--task",
+        type=str,
+        default="AutoSeg",
+        help="Task name or path to task directory. If it's a name, will use tasks/{task}; if it's a path, will use it directly"
+    )
+    task_group.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Results output directory (defaults to results/{task_name})"
+    )
+    task_group.add_argument(
+        "--config",
+        type=str,
+        default='config/default_config.yaml',
+        help="Path to configuration file"
+    )
+    
+    # ========================================
+    # Idea Generation Phase
+    # ========================================
+    idea_group = parser.add_argument_group('Idea Generation Phase')
+    idea_group.add_argument(
+        "--skip_idea_generation",
+        action="store_true",
+        help="Skip idea generation and use existing ideas from idea_path"
+    )
+    idea_group.add_argument(
+        "--idea_path",
+        type=str,
+        default=None,
+        help="Path to existing ideas JSON (used when skip_idea_generation=True)"
+    )
+    idea_group.add_argument(
+        "--ref_code_path",
+        type=str,
+        default=None,
+        help="Baseline reference code path (defaults to {task_dir}/experiment.py)"
+    )
+    idea_group.add_argument(
+        "--offline_feedback",
+        type=str,
+        default='config/feedback_global.json',
+        help="Offline feedback file for idea generation"
+    )
+    
+    # ========================================
+    # Experiment Execution Config
+    # ========================================
+    exp_group = parser.add_argument_group('Experiment Execution Phase')
+    exp_group.add_argument(
+        "--exp_backend",
+        type=str,
+        required=False,
+        default="",
+        choices=["", "aider", "openhands"],
+        help="Experiment backend to use (default: empty string, skips experiment execution)"
+    )
+    # Note: Model configuration is handled through config file (experiment.model)
+    exp_group.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs (e.g., '0,1,2')"
+    )
+
+    # Note: OpenHands-specific configuration (mount_paths, uri_prefix) is handled through config file
+    
+    return parser.parse_args()
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+def main():
+    logger = setup_logging()
+    args = parse_arguments()
+    print(f"args: {args}")
+    
+    # Setup task directory
+    # If task is a path (contains / or \), use it directly; otherwise use tasks/{task}
+    if '/' in args.task or '\\' in args.task or osp.isdir(args.task):
+        args.task_dir = args.task
+        args.task_name = osp.basename(args.task.rstrip('/\\'))
+    else:
+        args.task_dir = osp.join("tasks", args.task)
+        args.task_name = args.task
+    
+    if not osp.exists(args.task_dir):
+        raise FileNotFoundError(f"Task directory not found: {args.task_dir}")
+    
+    # Setup reference code path
+    if args.ref_code_path is None:
+        args.ref_code_path = osp.join(args.task_dir, "experiment.py")
+    
+    # Setup output directory
+    if args.output_dir is None:
+        args.output_dir = osp.join("results", args.task_name)
+    else:
+        args.output_dir = osp.join("results", args.output_dir)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    logger.info("=" * 80)
+    logger.info("InternAgent Pipeline Started")
+    logger.info(f"Task: {args.task_name}")
+    logger.info(f"Task Directory: {args.task_dir}")
+    logger.info(f"Experiment Backend: {args.exp_backend}")
+    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info("=" * 80)
+    
+    # Step 1: Idea Generation
+    if args.skip_idea_generation:
+        logger.info("Skipping idea generation, loading existing ideas...")
+        if not args.idea_path or not osp.exists(args.idea_path):
+            raise FileNotFoundError(f"Idea path not found: {args.idea_path}")
+        
+        with open(args.idea_path, 'r') as f:
+            ideas_data = json.load(f)
+        
+        # Extract top hypotheses
+        if 'hypotheses' in ideas_data and 'top_hypotheses' in ideas_data:
+            top_ideas = [
+                item for item in ideas_data['hypotheses']
+                if item['id'] in ideas_data['top_hypotheses']
+            ]
+        else:
+            # Assume it's already a list of ideas
+            top_ideas = ideas_data
+        
+        logger.info(f"Loaded {len(top_ideas)} ideas from {args.idea_path}")
+        session_json = args.idea_path
+        
+    else:
+        logger.info("Starting idea generation with MAS...")
+        idea_generator = IdeaGenerator(args, logger)
+        
+        try:
+            top_ideas, session_json = asyncio.run(idea_generator.generate_ideas())
+        except Exception as e:
+            logger.error(f"Idea generation failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Save ideas in standard format
+        ideas_output = osp.join(args.output_dir, "ideas.json")
+        os.makedirs(osp.dirname(ideas_output), exist_ok=True)
+        
+        aligned_ideas = [idea['refined_method_details'] for idea in top_ideas]
+        with open(ideas_output, 'w') as f:
+            json.dump(aligned_ideas, f, indent=4)
+        
+        logger.info(f"Ideas saved to {ideas_output}")
+    
+    # Step 2: Experiment Execution
+    if args.exp_backend:
+        logger.info("=" * 80)
+        logger.info(f"Starting experiment execution with {args.exp_backend} backend")
+        logger.info(f"Number of ideas to test: {len(top_ideas)}")
+        logger.info("=" * 80)
+        
+        # Setup GPU configuration
+        if args.gpus:
+            gpu_ids = [int(gid) for gid in args.gpus.split(',')]
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+            logger.info(f"Using GPUs: {gpu_ids}")
+        else:
+            available_gpus = list(range(torch.cuda.device_count()))
+            logger.info(f"Using all available GPUs: {available_gpus}")
+        
+        # Load config for experiment runner
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+                logger.info(f"Loaded experiment config from {args.config}")
+            except Exception as e:
+                logger.warning(f"Failed to load experiment config: {e}")
+
+        # Validate backend-specific requirements
+        if args.exp_backend == "openhands":
+            openhands_config = config.get("experiment", {}).get("openhands", {})
+            mount_paths = openhands_config.get("mount_paths", [])
+            uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
+
+            if not mount_paths:
+                logger.warning("No mount paths specified in config for OpenHands backend")
+            else:
+                logger.info(f"OpenHands mount paths: {mount_paths}")
+            logger.info(f"OpenHands URI prefix: {uri_prefix}")
+
+        # Run experiments
+        experiment_runner = ExperimentRunner(args, logger, config)
+        
+        try:
+            results = experiment_runner.run_experiments(
+                base_dir=args.task_dir,
+                results_dir=args.output_dir,
+                ideas=top_ideas
+            )
+        except Exception as e:
+            logger.error(f"Experiment execution failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Step 3: Summary
+        logger.info("=" * 80)
+        logger.info("InternAgent Run Completed")
+        logger.info("=" * 80)
+        
+        successful = sum(1 for r in results if r['success'])
+        failed = len(results) - successful
+        
+        logger.info(f"Total ideas tested: {len(results)}")
+        logger.info(f"Successful experiments: {successful}")
+        logger.info(f"Failed experiments: {failed}")
+        
+        # Print detailed results
+        logger.info("\nDetailed Results:")
+        for i, result in enumerate(results, 1):
+            status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+            logger.info(f"  {i}. {result['idea_name']}: {status}")
+            if 'error' in result:
+                logger.info(f"     Error: {result['error']}")
+    else:
+        logger.info("=" * 80)
+        logger.info("Skipping experiment execution (exp_backend is empty)")
+        logger.info("=" * 80)
+        results = []
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+            except Exception as e:
+                pass
+    
+    # Save summary
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'task': args.task_name,
+        'task_dir': args.task_dir,
+        'exp_backend': args.exp_backend,
+        'output_dir': args.output_dir,
+        'ideas_source': session_json if not args.skip_idea_generation else args.idea_path,
+        'skip_idea_generation': args.skip_idea_generation,
+        'model': (
+            config.get("experiment", {}).get("model") or  # Config file
+            # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            config.get("models", {}).get("default_provider", "azure") or
+            "azure/gpt-4o-mini"  # 與系統配置一致的預設值
+        ),
+        'total_ideas': len(results),
+        'successful': sum(1 for r in results if r.get('success', False)) if results else 0,
+        'failed': len(results) - sum(1 for r in results if r.get('success', False)) if results else 0,
+        'results': results
+    }
+    
+    summary_path = osp.join(args.output_dir, "discovery_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    logger.info(f"\nSummary saved to {summary_path}")
+    logger.info("=" * 80)
+    logger.info("All done!")
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDiscovery pipeline interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\nFatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+```
+
+檢查 `run_pipeline.sh`，確認不帶參數時不傳遞 `--exp_backend`：
+
+
+檢查 log 訊息，確認當 `exp_backend` 為空時訊息正確：
+
+
+調整 log 訊息，當 `exp_backend` 為空時顯示更清楚的訊息：
+
+
+```python
+"""
+Launch InternAgent 
+"""
+import os
+import os.path as osp
+import sys
+import json
+import argparse
+import asyncio
+import logging
+import torch
+import yaml
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Import MAS components
+from internagent.stage import IdeaGenerator, ExperimentRunner
+
+load_dotenv()
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+def setup_logging():
+    """Setup logging configuration"""
+    log_dir = 'logs'
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = osp.join(log_dir, f'{datetime.now().strftime("%Y%m%d_%H%M%S")}_internagent.log')
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(log_file)
+        ]
+    )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    return logging.getLogger("InternAgent")
+
+
+# ============================================================================
+# Argument Parser
+# ============================================================================
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Integrated InternAgent Pipeline: Idea Generation + Experiment Execution"
+    )
+    
+    # ========================================
+    # Task Configuration
+    # ========================================
+    task_group = parser.add_argument_group('Task Configuration')
+    task_group.add_argument(
+        "--task",
+        type=str,
+        default="AutoSeg",
+        help="Task name or path to task directory. If it's a name, will use tasks/{task}; if it's a path, will use it directly"
+    )
+    task_group.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Results output directory (defaults to results/{task_name})"
+    )
+    task_group.add_argument(
+        "--config",
+        type=str,
+        default='config/default_config.yaml',
+        help="Path to configuration file"
+    )
+    
+    # ========================================
+    # Idea Generation Phase
+    # ========================================
+    idea_group = parser.add_argument_group('Idea Generation Phase')
+    idea_group.add_argument(
+        "--skip_idea_generation",
+        action="store_true",
+        help="Skip idea generation and use existing ideas from idea_path"
+    )
+    idea_group.add_argument(
+        "--idea_path",
+        type=str,
+        default=None,
+        help="Path to existing ideas JSON (used when skip_idea_generation=True)"
+    )
+    idea_group.add_argument(
+        "--ref_code_path",
+        type=str,
+        default=None,
+        help="Baseline reference code path (defaults to {task_dir}/experiment.py)"
+    )
+    idea_group.add_argument(
+        "--offline_feedback",
+        type=str,
+        default='config/feedback_global.json',
+        help="Offline feedback file for idea generation"
+    )
+    
+    # ========================================
+    # Experiment Execution Config
+    # ========================================
+    exp_group = parser.add_argument_group('Experiment Execution Phase')
+    exp_group.add_argument(
+        "--exp_backend",
+        type=str,
+        required=False,
+        default="",
+        choices=["", "aider", "openhands"],
+        help="Experiment backend to use (default: empty string, skips experiment execution)"
+    )
+    # Note: Model configuration is handled through config file (experiment.model)
+    exp_group.add_argument(
+        "--gpus",
+        type=str,
+        default=None,
+        help="Comma-separated GPU IDs (e.g., '0,1,2')"
+    )
+
+    # Note: OpenHands-specific configuration (mount_paths, uri_prefix) is handled through config file
+    
+    return parser.parse_args()
+
+
+# ============================================================================
+# Main Pipeline
+# ============================================================================
+def main():
+    logger = setup_logging()
+    args = parse_arguments()
+    print(f"args: {args}")
+    
+    # Setup task directory
+    # If task is a path (contains / or \), use it directly; otherwise use tasks/{task}
+    if '/' in args.task or '\\' in args.task or osp.isdir(args.task):
+        args.task_dir = args.task
+        args.task_name = osp.basename(args.task.rstrip('/\\'))
+    else:
+        args.task_dir = osp.join("tasks", args.task)
+        args.task_name = args.task
+    
+    if not osp.exists(args.task_dir):
+        raise FileNotFoundError(f"Task directory not found: {args.task_dir}")
+    
+    # Setup reference code path
+    if args.ref_code_path is None:
+        args.ref_code_path = osp.join(args.task_dir, "experiment.py")
+    
+    # Setup output directory
+    if args.output_dir is None:
+        args.output_dir = osp.join("results", args.task_name)
+    else:
+        args.output_dir = osp.join("results", args.output_dir)
+    
+    os.makedirs(args.output_dir, exist_ok=True)
+    
+    logger.info("=" * 80)
+    logger.info("InternAgent Pipeline Started")
+    logger.info(f"Task: {args.task_name}")
+    logger.info(f"Task Directory: {args.task_dir}")
+    if args.exp_backend:
+        logger.info(f"Experiment Backend: {args.exp_backend}")
+    else:
+        logger.info("Experiment Backend: (empty, experiment execution will be skipped)")
+    logger.info(f"Output Directory: {args.output_dir}")
+    logger.info("=" * 80)
+    
+    # Step 1: Idea Generation
+    if args.skip_idea_generation:
+        logger.info("Skipping idea generation, loading existing ideas...")
+        if not args.idea_path or not osp.exists(args.idea_path):
+            raise FileNotFoundError(f"Idea path not found: {args.idea_path}")
+        
+        with open(args.idea_path, 'r') as f:
+            ideas_data = json.load(f)
+        
+        # Extract top hypotheses
+        if 'hypotheses' in ideas_data and 'top_hypotheses' in ideas_data:
+            top_ideas = [
+                item for item in ideas_data['hypotheses']
+                if item['id'] in ideas_data['top_hypotheses']
+            ]
+        else:
+            # Assume it's already a list of ideas
+            top_ideas = ideas_data
+        
+        logger.info(f"Loaded {len(top_ideas)} ideas from {args.idea_path}")
+        session_json = args.idea_path
+        
+    else:
+        logger.info("Starting idea generation with MAS...")
+        idea_generator = IdeaGenerator(args, logger)
+        
+        try:
+            top_ideas, session_json = asyncio.run(idea_generator.generate_ideas())
+        except Exception as e:
+            logger.error(f"Idea generation failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Save ideas in standard format
+        ideas_output = osp.join(args.output_dir, "ideas.json")
+        os.makedirs(osp.dirname(ideas_output), exist_ok=True)
+        
+        aligned_ideas = [idea['refined_method_details'] for idea in top_ideas]
+        with open(ideas_output, 'w') as f:
+            json.dump(aligned_ideas, f, indent=4)
+        
+        logger.info(f"Ideas saved to {ideas_output}")
+    
+    # Step 2: Experiment Execution
+    if args.exp_backend:
+        logger.info("=" * 80)
+        logger.info(f"Starting experiment execution with {args.exp_backend} backend")
+        logger.info(f"Number of ideas to test: {len(top_ideas)}")
+        logger.info("=" * 80)
+        
+        # Setup GPU configuration
+        if args.gpus:
+            gpu_ids = [int(gid) for gid in args.gpus.split(',')]
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+            logger.info(f"Using GPUs: {gpu_ids}")
+        else:
+            available_gpus = list(range(torch.cuda.device_count()))
+            logger.info(f"Using all available GPUs: {available_gpus}")
+        
+        # Load config for experiment runner
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+                logger.info(f"Loaded experiment config from {args.config}")
+            except Exception as e:
+                logger.warning(f"Failed to load experiment config: {e}")
+
+        # Validate backend-specific requirements
+        if args.exp_backend == "openhands":
+            openhands_config = config.get("experiment", {}).get("openhands", {})
+            mount_paths = openhands_config.get("mount_paths", [])
+            uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
+
+            if not mount_paths:
+                logger.warning("No mount paths specified in config for OpenHands backend")
+            else:
+                logger.info(f"OpenHands mount paths: {mount_paths}")
+            logger.info(f"OpenHands URI prefix: {uri_prefix}")
+
+        # Run experiments
+        experiment_runner = ExperimentRunner(args, logger, config)
+        
+        try:
+            results = experiment_runner.run_experiments(
+                base_dir=args.task_dir,
+                results_dir=args.output_dir,
+                ideas=top_ideas
+            )
+        except Exception as e:
+            logger.error(f"Experiment execution failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Step 3: Summary
+        logger.info("=" * 80)
+        logger.info("InternAgent Run Completed")
+        logger.info("=" * 80)
+        
+        successful = sum(1 for r in results if r['success'])
+        failed = len(results) - successful
+        
+        logger.info(f"Total ideas tested: {len(results)}")
+        logger.info(f"Successful experiments: {successful}")
+        logger.info(f"Failed experiments: {failed}")
+        
+        # Print detailed results
+        logger.info("\nDetailed Results:")
+        for i, result in enumerate(results, 1):
+            status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+            logger.info(f"  {i}. {result['idea_name']}: {status}")
+            if 'error' in result:
+                logger.info(f"     Error: {result['error']}")
+    else:
+        logger.info("=" * 80)
+        logger.info("Skipping experiment execution (exp_backend is empty)")
+        logger.info("=" * 80)
+        results = []
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+            except Exception as e:
+                pass
+    
+    # Save summary
+    summary = {
+        'timestamp': datetime.now().isoformat(),
+        'task': args.task_name,
+        'task_dir': args.task_dir,
+        'exp_backend': args.exp_backend,
+        'output_dir': args.output_dir,
+        'ideas_source': session_json if not args.skip_idea_generation else args.idea_path,
+        'skip_idea_generation': args.skip_idea_generation,
+        'model': (
+            config.get("experiment", {}).get("model") or  # Config file
+            # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
+            config.get("models", {}).get("default_provider", "azure") or
+            "azure/gpt-4o-mini"  # 與系統配置一致的預設值
+        ),
+        'total_ideas': len(results),
+        'successful': sum(1 for r in results if r.get('success', False)) if results else 0,
+        'failed': len(results) - sum(1 for r in results if r.get('success', False)) if results else 0,
+        'results': results
+    }
+    
+    summary_path = osp.join(args.output_dir, "discovery_summary.json")
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=4)
+    
+    logger.info(f"\nSummary saved to {summary_path}")
+    logger.info("=" * 80)
+    logger.info("All done!")
+
+
+# ============================================================================
+# Entry Point
+# ============================================================================
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nDiscovery pipeline interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\nFatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+```
+
+檢查 linter 錯誤：
+
+
+已完成修改：
+
+1. **修改 `launch_discovery.py`**：
+   - 將 `exp_backend` 預設值改為空字串 `''`，並允許空字串作為選項
+   - 在 Step 2 開始添加條件：當 `exp_backend` 為空時跳過 Experiment 執行
+   - 修正 summary 統計計算邏輯
+   - 調整 log 訊息，當 `exp_backend` 為空時顯示明確說明
+
+2. **`run_pipeline.sh`**：
+   - 已正確：不帶參數時不傳遞 `--exp_backend`，使用預設值（空字串）
+
+行為：
+- 不帶參數：`./scripts/run_pipeline.sh` → `exp_backend=''`，跳過 Experiment 執行
+- 帶參數：`./scripts/run_pipeline.sh aider` → 執行 Experiment（使用 aider backend）
+
+當 `exp_backend=''` 時，會顯示訊息 "Skipping experiment execution (exp_backend is empty)"，並只執行 Idea Generation 階段。
+

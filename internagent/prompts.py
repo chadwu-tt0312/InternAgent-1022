@@ -11,9 +11,49 @@ For reference, the baseline results are as follows:
 
 {baseline_results}
 
+**CRITICAL: Before making any code changes, you MUST first read the current experiment.py file to see the exact code content, including all whitespace, indentation, and comments.** This ensures your SEARCH blocks will match exactly.
+
 Then, you need to implement code based on your plan. After you complete each change, we will run the command `python experiment.py --out_dir=run_i' where i is the run number and evaluate the results.
 YOUR PROPOSED CHANGE MUST USE THIS COMMAND FORMAT, DO NOT ADD ADDITIONAL COMMAND LINE ARGS.
 You can then implement the next thing on your list.
+
+**SEARCH/REPLACE Format Requirements:**
+When modifying code, you MUST use the SEARCH/REPLACE format. Here is the CORRECT format:
+
+```python
+<<<<<<< SEARCH
+from pfaa import ParameterFreeAdaptiveAttention
+=======
+from pfaa import ParameterFreeAdaptiveAttention
+from encoder import Encoder
+>>>>>>> REPLACE
+```
+
+**Common Mistakes to Avoid:**
+1. **Whitespace mismatch**: The SEARCH block must match EXACTLY, including:
+   - Spaces vs tabs (must match the file)
+   - Trailing spaces at end of lines
+   - Multiple spaces vs single space
+   - Line endings (should match file)
+
+2. **Indentation mismatch**: 
+   - Use the EXACT same indentation (spaces or tabs) as the file
+   - Count spaces carefully if using spaces
+   - Do not mix tabs and spaces
+
+3. **Comment differences**: 
+   - Include comments exactly as they appear in the file
+   - Do not omit or modify existing comments
+
+4. **Incomplete context**: 
+   - Include enough surrounding code to uniquely identify the location
+   - Use function/class names or distinctive code patterns as anchors
+
+**Best Practices:**
+- Read the file first to see the exact formatting
+- Use smaller, more precise SEARCH blocks rather than large ones
+- Include context lines before and after your target code
+- Test your SEARCH block mentally: could it match multiple places? If yes, add more context.
 
 Any modifications to `argparse` parameters (new/updated) **must enforce the improved implementation as the default behavior** unless explicitly designed as optional. Specifically:  Set `default=<revised_value>` for all altered arguments to ensure the enhanced logic activates automatically without CLI flags. Ensure the improved functionality should be the default experience without requiring users to specify additional command-line parameters.
 """

@@ -77,6 +77,112 @@ def info_traceback(stderr):
     return matches, message
 
 
+def extract_code_snippet_from_file(file_path, search_block, context_lines=5):
+    """
+    Extract code snippet from file that should match the failed SEARCH block.
+    
+    Args:
+        file_path: Path to the experiment.py file
+        search_block: The SEARCH block that failed to match (as string)
+        context_lines: Number of context lines to include before and after
+    
+    Returns:
+        str: Extracted code snippet with context, or None if extraction fails
+    """
+    try:
+        if not osp.exists(file_path):
+            return None
+        
+        with open(file_path, 'r', encoding='utf-8') as f:
+            file_content = f.read()
+            file_lines = file_content.split('\n')
+        
+        # Try to find the search block in the file
+        # First, normalize the search block (remove leading/trailing whitespace from lines)
+        search_lines = [line.rstrip() for line in search_block.strip().split('\n') if line.strip()]
+        
+        if not search_lines:
+            return None
+        
+        # Try to find the first line of the search block in the file
+        first_line_pattern = search_lines[0].strip()
+        
+        # Search for matching line (allowing for some flexibility)
+        for i, line in enumerate(file_lines):
+            if first_line_pattern in line.rstrip() or line.rstrip() in first_line_pattern:
+                # Found potential match, extract context
+                start = max(0, i - context_lines)
+                end = min(len(file_lines), i + len(search_lines) + context_lines)
+                
+                snippet_lines = file_lines[start:end]
+                
+                # Add line numbers for reference
+                snippet_with_numbers = []
+                for idx, snippet_line in enumerate(snippet_lines, start=start + 1):
+                    snippet_with_numbers.append(f"{idx:4d} | {snippet_line}")
+                
+                return '\n'.join(snippet_with_numbers)
+        
+        # If exact match not found, return a general snippet from the file
+        # Try to extract around likely modification points (imports, class definitions, etc.)
+        for i, line in enumerate(file_lines):
+            if any(keyword in line for keyword in ['import', 'class ', 'def ', 'from ']):
+                start = max(0, i - context_lines)
+                end = min(len(file_lines), i + 10 + context_lines)
+                snippet_lines = file_lines[start:end]
+                snippet_with_numbers = []
+                for idx, snippet_line in enumerate(snippet_lines, start=start + 1):
+                    snippet_with_numbers.append(f"{idx:4d} | {snippet_line}")
+                return '\n'.join(snippet_with_numbers)
+        
+        # Fallback: return first 50 lines with context
+        snippet_lines = file_lines[:50]
+        snippet_with_numbers = []
+        for idx, snippet_line in enumerate(snippet_lines, start=1):
+            snippet_with_numbers.append(f"{idx:4d} | {snippet_line}")
+        return '\n'.join(snippet_with_numbers)
+        
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Failed to extract code snippet: {str(e)}")
+        return None
+
+
+def extract_search_block_from_error(coder_output):
+    """
+    Try to extract the failed SEARCH block from aider error output.
+    
+    Args:
+        coder_output: The output from coder.run()
+    
+    Returns:
+        str: The SEARCH block that failed, or None if not found
+    """
+    try:
+        # Look for SEARCH blocks in the output
+        # Pattern: <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE
+        pattern = r'<<<<<<< SEARCH\s*\n(.*?)\n=======\s*\n(.*?)\n>>>>>>> REPLACE'
+        matches = re.findall(pattern, coder_output, re.DOTALL)
+        
+        if matches:
+            # Return the first SEARCH block found
+            return matches[0][0]  # First group is the SEARCH block
+        
+        # Alternative: Look for "SEARCH" blocks in different formats
+        pattern2 = r'SEARCH\s*\n(.*?)(?:\n=======|$)'
+        matches2 = re.findall(pattern2, coder_output, re.DOTALL)
+        if matches2:
+            return matches2[0]
+        
+        return None
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"Failed to extract SEARCH block from error: {str(e)}")
+        return None
+
+
 # RUN EXPERIMENT
 def run_experiment(folder_name, run_num, timeout=27000):
     cwd = osp.abspath(folder_name)
@@ -170,6 +276,15 @@ def run_experiment(folder_name, run_num, timeout=27000):
 
 # PERFORM EXPERIMENTS
 def perform_experiments(idea, folder_name, coder, baseline_results) -> bool:
+    """
+    Perform experiments using Aider backend.
+    
+    Returns:
+        bool: True if all experiments completed successfully, False otherwise
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     ## RUN EXPERIMENT
     current_iter = 0
     run = 1
@@ -181,37 +296,177 @@ def perform_experiments(idea, folder_name, coder, baseline_results) -> bool:
         max_runs=MAX_RUNS,
         baseline_results=baseline_results,
     )
-    while run < MAX_RUNS + 1:
-        if current_iter >= MAX_ITERS:
-            print("Max iterations reached")
-            break
-        coder_out = coder.run(next_prompt) # 1. method2code
-        print(coder_out)
-        if "litellm.BadRequestError" in coder_out:
-            return False
-        if "ALL_COMPLETED" in coder_out:
-            break
-        if filecmp.cmp(os.path.join(folder_name, 'experiment.py'), os.path.join(folder_name, 'run_0', 'experiment.py')):
-            print("do not modify code")
-            continue
+    
+    try:
+        while run < MAX_RUNS + 1:
+            if current_iter >= MAX_ITERS:
+                logger.warning(f"Max iterations ({MAX_ITERS}) reached for run {run}")
+                break
+            
+            try:
+                coder_out = coder.run(next_prompt) # 1. method2code
+                print(coder_out)
+                
+                # Check for API errors
+                if "litellm.BadRequestError" in coder_out:
+                    logger.error("BadRequestError detected in coder output - likely API issue")
+                    return False
+                if "rate limit" in coder_out.lower() or "ratelimit" in coder_out.lower():
+                    logger.error("Rate limit detected in coder output")
+                    return False
+                if "ALL_COMPLETED" in coder_out:
+                    logger.info("All experiments completed successfully")
+                    break
+                
+                # Check if code was modified
+                if filecmp.cmp(os.path.join(folder_name, 'experiment.py'), 
+                             os.path.join(folder_name, 'run_0', 'experiment.py')):
+                    logger.warning("Code was not modified - skipping run")
+                    
+                    # Check if aider failed to match SEARCH blocks
+                    if "failed to match" in coder_out.lower() or "search/replace" in coder_out.lower():
+                        logger.warning("Aider SEARCH/REPLACE blocks failed to match file content")
+                        
+                        # Try to extract the failed SEARCH block and actual code snippet
+                        failed_search_block = extract_search_block_from_error(coder_out)
+                        experiment_file = os.path.join(folder_name, 'experiment.py')
+                        code_snippet = None
+                        
+                        if failed_search_block:
+                            logger.debug(f"Extracted failed SEARCH block: {failed_search_block[:200]}...")
+                            code_snippet = extract_code_snippet_from_file(
+                                experiment_file, 
+                                failed_search_block, 
+                                context_lines=10
+                            )
+                        
+                        # Build enhanced retry prompt
+                        retry_prompt_parts = [
+                            "Previous modification attempt FAILED because the SEARCH blocks did not exactly match the file content.",
+                            "",
+                            "CRITICAL INSTRUCTIONS:",
+                            "1. Read the current experiment.py file FIRST to see the exact formatting",
+                            "2. Compare your SEARCH block with the actual file content below",
+                            "3. Ensure your SEARCH block matches EXACTLY including:",
+                            "   - All whitespace (spaces vs tabs)",
+                            "   - Exact indentation (count spaces carefully)",
+                            "   - Trailing spaces at end of lines",
+                            "   - All comments as they appear in the file",
+                            "   - Line endings",
+                            "4. Use SMALLER, more precise SEARCH blocks with enough context",
+                            "5. Include line numbers from the file for reference when constructing your SEARCH block",
+                        ]
+                        
+                        if code_snippet:
+                            retry_prompt_parts.extend([
+                                "",
+                                "Here is the relevant code snippet from the current experiment.py file:",
+                                "(Pay attention to the exact formatting, especially whitespace and indentation)",
+                                "",
+                                "```python",
+                                code_snippet,
+                                "```",
+                                "",
+                                "Use this ACTUAL code as reference when creating your SEARCH block. ",
+                                "Copy the EXACT text including all whitespace, indentation, and comments."
+                            ])
+                        else:
+                            retry_prompt_parts.extend([
+                                "",
+                                "NOTE: Unable to extract the exact code snippet. ",
+                                "Please read the entire experiment.py file first before attempting modifications."
+                            ])
+                        
+                        if failed_search_block:
+                            retry_prompt_parts.extend([
+                                "",
+                                "The SEARCH block that failed was:",
+                                "```python",
+                                failed_search_block[:500] + ("..." if len(failed_search_block) > 500 else ""),
+                                "```",
+                                "",
+                                "Compare this with the actual file content above and identify the differences."
+                            ])
+                        
+                        retry_prompt_parts.extend([
+                            "",
+                            "---",
+                            "Original prompt:",
+                            next_prompt
+                        ])
+                        
+                        next_prompt = "\n".join(retry_prompt_parts)
+                    
+                    # Increment iteration counter to prevent infinite loops
+                    current_iter += 1
+                    if current_iter >= MAX_ITERS:
+                        logger.error(f"Max iterations ({MAX_ITERS}) reached - aider unable to modify code")
+                        break
+                    continue
+                
+                # 2. autodebug - run experiment
+                return_code, next_prompt, traceback, message = run_experiment(folder_name, run)
+                
+                # Handle errors with traceback
+                if traceback:
+                    logger.warning(f"Run {run} failed with traceback")
+                    functions_codes = ""
+                    for t in traceback:
+                        functions_codes = functions_codes + f"line: {t[1]}, function: {t[2]}, codes: {t[3]} \n"
+
+                    try:
+                        code_structure = coder.run(CODE_STRUCTURE_PROMPT.format(
+                            error_messages=next_prompt, 
+                            function_code=functions_codes
+                        ))
+                        next_prompt = DEBUG_PROMPT_WITH_STRUCTURE.format(
+                            error_messages=next_prompt, 
+                            code_structure=code_structure
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to generate code structure for debugging: {str(e)}")
+                        # Continue with original error message
+                
+                # Check return code
+                if return_code == 0:
+                    logger.info(f"Run {run} completed successfully")
+                    run += 1
+                    current_iter = 0
+                else:
+                    logger.warning(f"Run {run} failed with return code {return_code}")
+                    if message:
+                        logger.debug(f"Error message: {message}")
+                    current_iter += 1
+                    
+            except Exception as e:
+                import traceback
+                error_type = type(e).__name__
+                error_msg = str(e)
+                logger.error(f"Exception in perform_experiments at run {run}, iteration {current_iter}:")
+                logger.error(f"  Error Type: {error_type}")
+                logger.error(f"  Error Message: {error_msg}")
+                logger.debug(f"  Traceback:\n{traceback.format_exc()}")
+                current_iter += 1
+                
+                # If we've exceeded max iterations, fail
+                if current_iter >= MAX_ITERS:
+                    logger.error(f"Max iterations reached after exception")
+                    break
         
-        # 2.autodebug
-        return_code, next_prompt, traceback, message = run_experiment(folder_name, run)#  request
-        # add traceback and code_structure
-        if traceback:
-            functions_codes = ""
-            for t in traceback:
-                functions_codes = functions_codes + f"line: {t[1]}, function: {t[2]}, codes: {t[3]} \n"
-
-            code_structure = coder.run(CODE_STRUCTURE_PROMPT.format(error_messages=next_prompt, function_code=functions_codes))
-
-            next_prompt = DEBUG_PROMPT_WITH_STRUCTURE.format(error_messages=next_prompt, code_structure=code_structure)
-
-        if return_code == 0:
-            run += 1
-            current_iter = 0
-        current_iter += 1
-    if current_iter >= MAX_ITERS:
-        print("Not all experiments completed.")
+        if current_iter >= MAX_ITERS:
+            logger.error("Not all experiments completed - max iterations reached")
+            return False
+        
+        if run <= MAX_RUNS:
+            logger.warning(f"Experiments stopped at run {run}, expected {MAX_RUNS} runs")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        import traceback
+        logger.error(f"Fatal error in perform_experiments:")
+        logger.error(f"  Error Type: {type(e).__name__}")
+        logger.error(f"  Error Message: {str(e)}")
+        logger.debug(f"  Traceback:\n{traceback.format_exc()}")
         return False
-    return True

@@ -225,6 +225,65 @@ class ExperimentRunner:
         sys.stderr = original_stderr
         log_file.close()
     
+    def _log_experiment_failure_details(self, folder_name: str, idea_name: str):
+        """
+        Log detailed failure information from experiment folder.
+        
+        Args:
+            folder_name: Path to experiment folder
+            idea_name: Name of the idea/experiment
+        """
+        try:
+            # Check for log file
+            log_path = osp.join(folder_name, "log.txt")
+            if osp.exists(log_path):
+                with open(log_path, "r") as f:
+                    log_content = f.read()
+                    if log_content.strip():
+                        # Show last 1000 characters of log
+                        log_snippet = log_content[-1000:] if len(log_content) > 1000 else log_content
+                        self.logger.debug(f"  Last log entries:\n{log_snippet}")
+            
+            # Check for traceback files
+            run_dirs = [d for d in os.listdir(folder_name) if d.startswith("run_") and osp.isdir(osp.join(folder_name, d))]
+            for run_dir in sorted(run_dirs, reverse=True):  # Check most recent runs first
+                traceback_path = osp.join(folder_name, run_dir, "traceback.log")
+                if osp.exists(traceback_path):
+                    with open(traceback_path, "r") as f:
+                        traceback_content = f.read()
+                        if traceback_content.strip():
+                            self.logger.error(f"  Traceback from {run_dir}:")
+                            # Show first 2000 characters of traceback
+                            tb_snippet = traceback_content[:2000] if len(traceback_content) > 2000 else traceback_content
+                            self.logger.error(f"    {tb_snippet}")
+                            if len(traceback_content) > 2000:
+                                self.logger.error(f"    ... (truncated, see {traceback_path} for full traceback)")
+                            break
+            
+            # Check for aider chat history
+            aider_chat_path = osp.join(folder_name, f"{idea_name}_aider.txt")
+            if osp.exists(aider_chat_path):
+                with open(aider_chat_path, "r") as f:
+                    chat_content = f.read()
+                    if chat_content.strip():
+                        # Look for error messages in chat
+                        lines = chat_content.split('\n')
+                        error_lines = [line for line in lines if any(keyword in line.lower() 
+                                                                    for keyword in ['error', 'failed', 'exception', 'traceback'])]
+                        if error_lines:
+                            self.logger.debug(f"  Error mentions in aider chat ({len(error_lines)} lines found)")
+                            for line in error_lines[-5:]:  # Show last 5 error lines
+                                self.logger.debug(f"    {line[:200]}")
+            
+            # Check experiment.py for syntax errors
+            exp_path = osp.join(folder_name, "experiment.py")
+            if osp.exists(exp_path):
+                # Could add syntax check here if needed
+                pass
+                
+        except Exception as e:
+            self.logger.debug(f"  Could not read failure details: {str(e)}")
+    
     def run_aider_experiment(self, base_dir, results_dir, idea):
         """Run experiment using Aider backend"""
         folder_name, idea_name = self.setup_experiment_folder(base_dir, results_dir, idea)
@@ -285,11 +344,29 @@ class ExperimentRunner:
             
             success = perform_experiments_aider(idea, folder_name, coder, baseline_results)
             
-            self.logger.info(f"Aider experiment {'succeeded' if success else 'failed'}: {idea_name}")
+            if success:
+                self.logger.info(f"Aider experiment succeeded: {idea_name}")
+            else:
+                self.logger.error(f"Aider experiment failed: {idea_name}")
+                # Try to read error details from experiment folder
+                self._log_experiment_failure_details(folder_name, idea_name)
+            
             return success
             
         except Exception as e:
-            self.logger.error(f"Aider experiment error: {str(e)}")
+            import traceback
+            error_type = type(e).__name__
+            error_msg = str(e)
+            error_tb = traceback.format_exc()
+            
+            self.logger.error(f"Aider experiment error for {idea_name}:")
+            self.logger.error(f"  Error Type: {error_type}")
+            self.logger.error(f"  Error Message: {error_msg}")
+            self.logger.debug(f"  Traceback:\n{error_tb}")
+            
+            # Try to log additional context if available
+            self._log_experiment_failure_details(folder_name, idea_name)
+            
             return False
         finally:
             self.restore_logging(original_stdout, original_stderr, log_file)

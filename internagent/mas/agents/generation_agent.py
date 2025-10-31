@@ -257,13 +257,16 @@ class GenerationAgent(BaseAgent):
                 else:
                     logger.info("Code summary does not exist! Generating code summary.")
                     # Use codeview agent to generate code summary
+                    # 取得全局配置（從 _global_config 或 config）
+                    global_config = getattr(self, '_global_config', {}) or getattr(self, 'config', {})
                     ref_code = get_repo_structure(
                         project_path=ref_code_path,
                         output_dir=ref_code_path,
                         output_name="code_summary.json",
                         ignore_list=None,
-                        model=self.model.model_name,
-                        provider="user"
+                        provider="user",
+                        config=global_config,
+                        model_name=self.model.model_name  # 保留作為後備
                     )
                 ref_code = ref_code['summary'] + "\n\n" + ref_code['key_files']
                 logger.info("Add reference code (CODEVIEW) to prompt")

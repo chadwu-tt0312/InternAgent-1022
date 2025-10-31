@@ -5,6 +5,23 @@ import json
 import time
 
 GITHUB_AI_TOKEN = os.getenv('GITHUB_AI_TOKEN', "Your_GITHUB_AI_TOKEN")
+USER_AGENT = os.getenv('USER_AGENT')  # Get User-Agent from environment variable
+
+def get_proxies():
+    """
+    Get proxy configuration from environment variables.
+    Returns a dict with 'http' and 'https' keys if proxies are set.
+    """
+    proxies = {}
+    http_proxy = os.getenv('HTTP_PROXY') or os.getenv('http_proxy')
+    https_proxy = os.getenv('HTTPS_PROXY') or os.getenv('https_proxy')
+    
+    if http_proxy:
+        proxies['http'] = http_proxy
+    if https_proxy:
+        proxies['https'] = https_proxy
+    
+    return proxies if proxies else None
 
 def search_github_repos(query, limit=5):
     """
@@ -17,11 +34,20 @@ def search_github_repos(query, limit=5):
     repos = []
     per_page = 10
     page = 1
+    
+    # Prepare headers with User-Agent if set
+    headers = {}
+    if USER_AGENT:
+        headers["User-Agent"] = USER_AGENT
+    
+    # Get proxy configuration
+    proxies = get_proxies()
+    
     while len(repos) < limit:
         
         url = f'https://api.github.com/search/repositories?q={query}&per_page={per_page}&page={page}'
 
-        response = requests.get(url)
+        response = requests.get(url, headers=headers, proxies=proxies)
 
         if response.status_code == 200:
             items = response.json().get('items', [])
@@ -83,11 +109,20 @@ def search_github_code(repo_owner: str,
         
     # Extract useful information
     formatted_results = []
+    
+    # Prepare headers with User-Agent if set
+    headers = {}
+    if USER_AGENT:
+        headers["User-Agent"] = USER_AGENT
+    
+    # Get proxy configuration
+    proxies = get_proxies()
+    
     for item in results['items']:
-        response = requests.get(item['url'])
+        response = requests.get(item['url'], headers=headers, proxies=proxies)
         if response.status_code == 200:
             download_url = response.json()['download_url']
-            response = requests.get(download_url)
+            response = requests.get(download_url, headers=headers, proxies=proxies)
             if response.status_code == 200:
                 content = response.text
             else:
@@ -114,13 +149,21 @@ class GitHubSearcher:
             token: GitHub Personal Access Token, optional
         """
         self.session = requests.Session()
+        
+        # Set proxy configuration
+        proxies = get_proxies()
+        if proxies:
+            self.session.proxies.update(proxies)
+        
         if token:
             self.session.headers.update({
                 'Authorization': f'token {token}',
                 'Accept': 'application/vnd.github.v3+json'
             })
+        # Use User-Agent from environment variable if set, otherwise use default
+        user_agent = USER_AGENT or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': user_agent
         })
         
     def search_code(self, 

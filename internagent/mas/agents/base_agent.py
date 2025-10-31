@@ -294,12 +294,17 @@ class BaseAgent(abc.ABC):
                 all retry attempts (max_retries). Contains details of the final error.
 
         Note:
-            The method sleeps for 1 second between retry attempts to avoid hammering
-            the API and potentially triggering rate limits. Consider this latency when
-            designing time-sensitive operations.
+            The method uses exponential backoff retry strategy:
+            - Initial delay: 5 seconds
+            - Delay doubles on each retry (5s, 10s, 20s, 40s, 80s)
+            - Maximum delay capped at 80 seconds
+            - This helps avoid hammering the API and triggering rate limits
+            Consider this latency when designing time-sensitive operations.
         """
         system_prompt = system_prompt or self.system_prompt
         remaining_retries = self.max_retries
+        retry_delay = 5.0  # Initial delay in seconds (will use exponential backoff)
+        max_delay = 80.0  # Maximum delay cap
         
         while True:
             try:
@@ -318,14 +323,22 @@ class BaseAgent(abc.ABC):
                     )
                     
             except Exception as e:
-                # sleep for a short time before retrying, log time count
-                await asyncio.sleep(1)
-                
                 remaining_retries -= 1
-                logger.warning(f"Agent {self.name} model call failed: {str(e)}. Retries left: {remaining_retries}")
                 
                 if remaining_retries <= 0:
-                    raise AgentExecutionError(f"Agent {self.name} failed after max retries: {str(e)}")
+                    raise AgentExecutionError(f"Agent {self.name} failed after {self.max_retries} retries: {str(e)}")
+                
+                # Log retry with delay information
+                logger.warning(
+                    f"Agent {self.name} model call failed: {str(e)}. "
+                    f"Retrying in {retry_delay:.1f}s ({remaining_retries} retries left)"
+                )
+                
+                # Sleep with exponential backoff
+                await asyncio.sleep(retry_delay)
+                
+                # Exponential backoff: double the delay, but cap at max_delay
+                retry_delay = min(retry_delay * 2, max_delay)
     
     def _format_context(self, context: Dict[str, Any]) -> str:
         """

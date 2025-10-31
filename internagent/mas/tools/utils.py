@@ -37,6 +37,34 @@ search_url = 'https://api.semanticscholar.org/graph/v1/paper/search/'
 graph_url = 'https://api.semanticscholar.org/graph/v1/paper/'
 rec_url = "https://api.semanticscholar.org/recommendations/v1/papers/forpaper/"
 
+def get_proxies():
+    """
+    Get proxy configuration from environment variables for requests library.
+    Returns a dict with 'http' and 'https' keys if proxies are set.
+    """
+    proxies = {}
+    http_proxy = os.getenv('HTTP_PROXY') or os.getenv('http_proxy')
+    https_proxy = os.getenv('HTTPS_PROXY') or os.getenv('https_proxy')
+    
+    if http_proxy:
+        proxies['http'] = http_proxy
+    if https_proxy:
+        proxies['https'] = https_proxy
+    
+    return proxies if proxies else None
+
+def get_httpx_proxies():
+    """
+    Get proxy configuration from environment variables for httpx library.
+    Returns proxy string or None.
+    httpx prefers HTTPS_PROXY > HTTP_PROXY
+    """
+    https_proxy = os.getenv('HTTPS_PROXY') or os.getenv('https_proxy')
+    http_proxy = os.getenv('HTTP_PROXY') or os.getenv('http_proxy')
+    
+    # httpx prefers https proxy for all requests if available
+    return https_proxy or http_proxy or None
+
 @dataclass
 class PaperMetadata:
     """Data class for paper metadata."""
@@ -131,7 +159,8 @@ def fetch_semantic_papers(keyword, max_results=20):
         'fields': 'title,year,citationCount,abstract,tldr,isOpenAccess,openAccessPdf'
     }
     headers = {'x-api-key': os.environ['S2_API_KEY']}  # Ensure you have the API key set
-    response = requests.get(search_url, params=query_params, headers=headers)
+    proxies = get_proxies()
+    response = requests.get(search_url, params=query_params, headers=headers, proxies=proxies)
 
     if response.status_code == 200:
         searched_data = response.json().get('data', [])
@@ -184,7 +213,8 @@ def fetch_pubmed_papers(query: str, max_results: int = 20, sort: str = "relevanc
     }
     
     try:
-        response = requests.get(search_url, params=search_params)
+        proxies = get_proxies()
+        response = requests.get(search_url, params=search_params, proxies=proxies)
         if response.status_code != 200:
             logger.error(f"PubMed search error: {response.status_code}")
             return []
@@ -204,7 +234,7 @@ def fetch_pubmed_papers(query: str, max_results: int = 20, sort: str = "relevanc
             "retmode": "xml"
         }
         
-        fetch_response = requests.get(fetch_url, params=fetch_params)
+        fetch_response = requests.get(fetch_url, params=fetch_params, proxies=proxies)
         if fetch_response.status_code != 200:
             logger.error(f"PubMed fetch error: {fetch_response.status_code}")
             return []
@@ -214,7 +244,7 @@ def fetch_pubmed_papers(query: str, max_results: int = 20, sort: str = "relevanc
         return papers
     
     except Exception as e:
-        logger.error(f"Error searching PubMed: {str(e)}")
+        logger.error(f"Error fetch_pubmed_papers(): {str(e)}")
         return []
 
 
@@ -253,7 +283,8 @@ def fetch_arxiv_papers(query: str, max_results: int = 20, sort: str = "relevance
     }
     
     try:
-        response = requests.get(search_url, params=search_params)
+        proxies = get_proxies()
+        response = requests.get(search_url, params=search_params, proxies=proxies)
         if response.status_code != 200:
             logger.error(f"arXiv search error: {response.status_code}")
             return []
@@ -538,7 +569,8 @@ def download_pdf(pdf_url, save_folder="pdfs"):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36",
     }
     try:
-        response = httpx.get(url=pdf_url,headers=headers, timeout=10, verify=False)
+        proxy = get_httpx_proxies()
+        response = httpx.get(url=pdf_url, headers=headers, timeout=10, verify=False, proxies=proxy)
         if response.status_code == 200:
             with open(save_path, "wb") as file:
                 file.write(response.content)
@@ -592,7 +624,8 @@ def download_pdf_by_doi(doi: str, download_dir: str = "downloaded_papers"):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
-    response = requests.get(doi_url, headers=headers, allow_redirects=True)
+    proxies = get_proxies()
+    response = requests.get(doi_url, headers=headers, allow_redirects=True, proxies=proxies)
     publisher_url = response.url
     logger.info(f"Redirected to the publisher page: {publisher_url}")
     
@@ -613,7 +646,8 @@ def download_pdf_by_doi(doi: str, download_dir: str = "downloaded_papers"):
         pdf_url = pdf_links[0]
         print(f"尝试下载: {pdf_url}")
         
-        pdf_response = requests.get(pdf_url, headers=headers, stream=True)
+        proxies = get_proxies()
+        pdf_response = requests.get(pdf_url, headers=headers, stream=True, proxies=proxies)
         if pdf_response.status_code == 200 and 'application/pdf' in pdf_response.headers.get('Content-Type', ''):
             # 创建下载目录
             os.makedirs(download_dir, exist_ok=True)
@@ -656,7 +690,8 @@ def get_pdf_url(paper_id, max_retries=5):
     params = {"fields": "openAccessPdf"}  
 
     headers = {'x-api-key': os.environ['S2_API_KEY']}
-    response = requests.get(url, params=params, headers=headers)
+    proxies = get_proxies()
+    response = requests.get(url, params=params, headers=headers, proxies=proxies)
 
     if response.status_code == 200:
         data = response.json()
@@ -667,7 +702,8 @@ def get_pdf_url(paper_id, max_retries=5):
         while attempt < max_retries:
             print("Rate limit exceeded. Sleeping for 10 seconds...")
             time.sleep(10) 
-            response = requests.get(url, params=params)
+            proxies = get_proxies()
+            response = requests.get(url, params=params, proxies=proxies)
             if response.status_code == 200:
                 data = response.json()
                 return data.get("openAccessPdf", {}).get("url")
@@ -687,7 +723,8 @@ def PaperQuery(paper_id):
         'fields': 'title,year,citationCount,abstract'
     }
     headers = {'x-api-key': os.environ['S2_API_KEY']}
-    response = requests.get(url=rec_url + paper_id, params=query_params, headers=headers)
+    proxies = get_proxies()
+    response = requests.get(url=rec_url + paper_id, params=query_params, headers=headers, proxies=proxies)
     if response.status_code == 200:
         return response.json()
     else:
@@ -699,7 +736,8 @@ def PaperDetails(paper_id, fields='title,year,abstract,authors,citationCount,ven
     ## get paper details based on paper id
     paper_data_query_params = {'fields': fields}
     headers = {'x-api-key': os.environ['S2_API_KEY']}
-    response = requests.get(url=graph_url + paper_id, params=paper_data_query_params, headers=headers)
+    proxies = get_proxies()
+    response = requests.get(url=graph_url + paper_id, params=paper_data_query_params, headers=headers, proxies=proxies)
     if response.status_code == 200:
         return response.json()
     else:

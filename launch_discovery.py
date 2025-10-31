@@ -105,9 +105,10 @@ def parse_arguments():
     exp_group.add_argument(
         "--exp_backend",
         type=str,
-        required=True,
-        choices=["aider", "openhands"],
-        help="Experiment backend to use"
+        required=False,
+        default="",
+        choices=["", "aider", "openhands"],
+        help="Experiment backend to use (default: empty string, skips experiment execution)"
     )
     # Note: Model configuration is handled through config file (experiment.model)
     exp_group.add_argument(
@@ -128,6 +129,7 @@ def parse_arguments():
 def main():
     logger = setup_logging()
     args = parse_arguments()
+    print(f"args: {args}")
     
     # Setup task directory
     # If task is a path (contains / or \), use it directly; otherwise use tasks/{task}
@@ -157,7 +159,10 @@ def main():
     logger.info("InternAgent Pipeline Started")
     logger.info(f"Task: {args.task_name}")
     logger.info(f"Task Directory: {args.task_dir}")
-    logger.info(f"Experiment Backend: {args.exp_backend}")
+    if args.exp_backend:
+        logger.info(f"Experiment Backend: {args.exp_backend}")
+    else:
+        logger.info("Experiment Backend: (empty, experiment execution will be skipped)")
     logger.info(f"Output Directory: {args.output_dir}")
     logger.info("=" * 80)
     
@@ -206,79 +211,95 @@ def main():
         logger.info(f"Ideas saved to {ideas_output}")
     
     # Step 2: Experiment Execution
-    logger.info("=" * 80)
-    logger.info(f"Starting experiment execution with {args.exp_backend} backend")
-    logger.info(f"Number of ideas to test: {len(top_ideas)}")
-    logger.info("=" * 80)
-    
-    # Setup GPU configuration
-    if args.gpus:
-        gpu_ids = [int(gid) for gid in args.gpus.split(',')]
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
-        logger.info(f"Using GPUs: {gpu_ids}")
-    else:
-        available_gpus = list(range(torch.cuda.device_count()))
-        logger.info(f"Using all available GPUs: {available_gpus}")
-    
-    # Load config for experiment runner
-    config = {}
-    if args.config and osp.exists(args.config):
-        try:
-            with open(args.config, 'r') as f:
-                if args.config.endswith(('.yaml', '.yml')):
-                    config = yaml.safe_load(f)
-                else:
-                    config = json.load(f)
-            logger.info(f"Loaded experiment config from {args.config}")
-        except Exception as e:
-            logger.warning(f"Failed to load experiment config: {e}")
-
-    # Validate backend-specific requirements
-    if args.exp_backend == "openhands":
-        openhands_config = config.get("experiment", {}).get("openhands", {})
-        mount_paths = openhands_config.get("mount_paths", [])
-        uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
-
-        if not mount_paths:
-            logger.warning("No mount paths specified in config for OpenHands backend")
+    if args.exp_backend:
+        logger.info("=" * 80)
+        logger.info(f"Starting experiment execution with {args.exp_backend} backend")
+        logger.info(f"Number of ideas to test: {len(top_ideas)}")
+        logger.info("=" * 80)
+        
+        # Setup GPU configuration
+        if args.gpus:
+            gpu_ids = [int(gid) for gid in args.gpus.split(',')]
+            os.environ["CUDA_VISIBLE_DEVICES"] = args.gpus
+            logger.info(f"Using GPUs: {gpu_ids}")
         else:
-            logger.info(f"OpenHands mount paths: {mount_paths}")
-        logger.info(f"OpenHands URI prefix: {uri_prefix}")
+            available_gpus = list(range(torch.cuda.device_count()))
+            logger.info(f"Using all available GPUs: {available_gpus}")
+        
+        # Load config for experiment runner
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+                logger.info(f"Loaded experiment config from {args.config}")
+            except Exception as e:
+                logger.warning(f"Failed to load experiment config: {e}")
 
-    # Run experiments
-    experiment_runner = ExperimentRunner(args, logger, config)
-    
-    try:
-        results = experiment_runner.run_experiments(
-            base_dir=args.task_dir,
-            results_dir=args.output_dir,
-            ideas=top_ideas
-        )
-    except Exception as e:
-        logger.error(f"Experiment execution failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    # Step 3: Summary
-    logger.info("=" * 80)
-    logger.info("InternAgent Run Completed")
-    logger.info("=" * 80)
-    
-    successful = sum(1 for r in results if r['success'])
-    failed = len(results) - successful
-    
-    logger.info(f"Total ideas tested: {len(results)}")
-    logger.info(f"Successful experiments: {successful}")
-    logger.info(f"Failed experiments: {failed}")
-    
-    # Print detailed results
-    logger.info("\nDetailed Results:")
-    for i, result in enumerate(results, 1):
-        status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
-        logger.info(f"  {i}. {result['idea_name']}: {status}")
-        if 'error' in result:
-            logger.info(f"     Error: {result['error']}")
+        # Validate backend-specific requirements
+        if args.exp_backend == "openhands":
+            openhands_config = config.get("experiment", {}).get("openhands", {})
+            mount_paths = openhands_config.get("mount_paths", [])
+            uri_prefix = openhands_config.get("uri_prefix", "ws://localhost:8001/ws/")
+
+            if not mount_paths:
+                logger.warning("No mount paths specified in config for OpenHands backend")
+            else:
+                logger.info(f"OpenHands mount paths: {mount_paths}")
+            logger.info(f"OpenHands URI prefix: {uri_prefix}")
+
+        # Run experiments
+        experiment_runner = ExperimentRunner(args, logger, config)
+        
+        try:
+            results = experiment_runner.run_experiments(
+                base_dir=args.task_dir,
+                results_dir=args.output_dir,
+                ideas=top_ideas
+            )
+        except Exception as e:
+            logger.error(f"Experiment execution failed: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+        
+        # Step 3: Summary
+        logger.info("=" * 80)
+        logger.info("InternAgent Run Completed")
+        logger.info("=" * 80)
+        
+        successful = sum(1 for r in results if r['success'])
+        failed = len(results) - successful
+        
+        logger.info(f"Total ideas tested: {len(results)}")
+        logger.info(f"Successful experiments: {successful}")
+        logger.info(f"Failed experiments: {failed}")
+        
+        # Print detailed results
+        logger.info("\nDetailed Results:")
+        for i, result in enumerate(results, 1):
+            status = "✓ SUCCESS" if result['success'] else "✗ FAILED"
+            logger.info(f"  {i}. {result['idea_name']}: {status}")
+            if 'error' in result:
+                logger.info(f"     Error: {result['error']}")
+    else:
+        logger.info("=" * 80)
+        logger.info("Skipping experiment execution (exp_backend is empty)")
+        logger.info("=" * 80)
+        results = []
+        config = {}
+        if args.config and osp.exists(args.config):
+            try:
+                with open(args.config, 'r') as f:
+                    if args.config.endswith(('.yaml', '.yml')):
+                        config = yaml.safe_load(f)
+                    else:
+                        config = json.load(f)
+            except Exception as e:
+                pass
     
     # Save summary
     summary = {
@@ -293,11 +314,11 @@ def main():
             config.get("experiment", {}).get("model") or  # Config file
             # "anthropic/claude-3-7-sonnet-20250219"  # Final fallback
             config.get("models", {}).get("default_provider", "azure") or
-            "azure/gpt-4.1-mini"  # 與系統配置一致的預設值
+            "azure/gpt-4o-mini"  # 與系統配置一致的預設值
         ),
         'total_ideas': len(results),
-        'successful': successful,
-        'failed': failed,
+        'successful': sum(1 for r in results if r.get('success', False)) if results else 0,
+        'failed': len(results) - sum(1 for r in results if r.get('success', False)) if results else 0,
         'results': results
     }
     

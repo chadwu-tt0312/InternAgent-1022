@@ -24,7 +24,7 @@ models:
 # CodeView Configuration
 codeview:
   model_provider: "default"
-  model_name: "gpt-4.1-mini"
+  model_name: "gpt-4o-mini"
 
 # Memory Configuration
 memory:
@@ -36,7 +36,7 @@ agents:
   # Idea Generation Agent
   generation:
     model_provider: "default"
-    generation_count: 3
+    generation_count: 5
     creativity: 0.7
     do_survey: false
 
@@ -68,10 +68,12 @@ agents:
   scholar:
     model_provider: "default"
     search_depth: "moderate"
+    sources: ["pubmed", "arxiv"]  # Options: "pubmed", "arxiv", "semantic_scholar" (not recommended)
 
   # Survey Agent
   survey:
     model_provider: "default"
+    sources: ["pubmed", "arxiv"]  # Options: "pubmed", "arxiv", "semantic_scholar" (not recommended)
 
 # Workflow Configuration
 workflow:

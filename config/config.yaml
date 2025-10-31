@@ -50,6 +50,7 @@ agents:
   survey:
     model_provider: "default"
     max_papers: 50
+    sources: ["pubmed", "arxiv"]  # Options: "pubmed", "arxiv", "semantic_scholar" (not recommended due to rate limits)
 
   # Reflection Agent (for critique and analysis)
   reflection:
@@ -87,6 +88,7 @@ agents:
     search_depth: "moderate"
     max_papers: 10
     temperature: 0.6
+    sources: ["pubmed", "arxiv"]  # Options: "pubmed", "arxiv", "semantic_scholar" (not recommended due to rate limits)
 
 # Workflow Configuration
 workflow:
@@ -111,7 +113,12 @@ tools:
 
   # Literature Search
   literature_search:
-    semantic_scholar_key: ""  # Set via environment variable SS_API_KEY
+    # API keys can be set via:
+    # 1. Environment variable: S2_API_KEY (recommended)
+    # 2. Config file: semantic_scholar_key (below) or api_keys.semantic_scholar
+    semantic_scholar_key: ""  # Deprecated: use S2_API_KEY env var or api_keys format below
+    api_keys:  # New format (preferred)
+      semantic_scholar: ""  # Overridden by S2_API_KEY env var if set
     max_results: 10
 
 # Logging Configuration (optional)

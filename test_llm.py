@@ -10,7 +10,7 @@
     uv run test_llm.py --provider openai
 
     # 指定模型名稱
-    uv run test_llm.py --provider azure --model-name gpt-4o-mini
+    uv run test_llm.py --provider azure --model-name gpt-4.1-mini
 
     # 使用配置檔
     uv run test_llm.py --config config/default_config.yaml

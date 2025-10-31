@@ -39,7 +39,8 @@ class ScholarAgent(BaseAgent):
         self.max_papers = config.get("max_papers", 5)
         self.search_depth = config.get("search_depth", "moderate")  # shallow, moderate, deep
         self.evidence_threshold = config.get("evidence_threshold", 0.6)  # Minimum relevance score
-        self.sources = config.get("sources", ["pubmed", "arxiv", "semantic_scholar"])
+        # Default to arxiv and pubmed only (semantic_scholar has frequent rate limit issues)
+        self.sources = config.get("sources", ["pubmed", "arxiv"])
         
         # Initialize tools
         tools_config = config.get("_global_config", {}).get("tools", {})
@@ -57,6 +58,17 @@ class ScholarAgent(BaseAgent):
         """
         email = config.get("email", "researcher@example.com")
         api_keys = config.get("api_keys", {})
+        
+        # Support both old format (semantic_scholar_key) and new format (api_keys)
+        # Also check environment variable
+        semantic_scholar_key = (
+            os.getenv("S2_API_KEY") or  # First try environment variable
+            api_keys.get("semantic_scholar") or  # Then try api_keys dict
+            config.get("semantic_scholar_key")  # Finally try old config format
+        )
+        
+        if semantic_scholar_key:
+            api_keys["semantic_scholar"] = semantic_scholar_key
         
         try:
             self.literature_search = LiteratureSearch(

@@ -9,7 +9,11 @@ if [ -d ".venv" ]; then
     fi
 fi
 
-uv run launch_discovery.py \
-    --task AutoSeg \
-    --exp_backend aider \
-    --gpus 0,1
+# Build command with optional exp_backend parameter
+CMD="uv run launch_discovery.py --task AutoSeg"
+if [ -n "$1" ]; then
+    CMD="$CMD --exp_backend $1"
+fi
+CMD="$CMD --gpus 0,1"
+
+eval $CMD
