@@ -10,7 +10,8 @@ if [ -d ".venv" ]; then
 fi
 
 # Build command with optional exp_backend parameter
-CMD="uv run launch_discovery.py --task AutoSeg"
+# CMD="uv run launch_discovery.py --task AutoSeg"
+CMD="uv run launch_discovery.py --task AutoMaterial"
 if [ -n "$1" ]; then
     CMD="$CMD --exp_backend $1"
 fi
