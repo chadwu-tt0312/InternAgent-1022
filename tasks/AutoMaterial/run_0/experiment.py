@@ -212,7 +212,10 @@ def load_matbench_data(task_name='matbench_mp_e_form', use_subset=False, subset_
         raise ImportError("matbench is required. Install with: pip install matbench")
     
     mb = MatbenchBenchmark(autoload=False)
-    task = mb.load_task(task_name)
+    task = mb.tasks_map[task_name]
+    
+    # Load the task dataset into memory
+    task.load()
     
     structures = []
     targets = []
@@ -226,16 +229,10 @@ def load_matbench_data(task_name='matbench_mp_e_form', use_subset=False, subset_
             train_inputs = train_inputs[:subset_size]
             train_outputs = train_outputs[:subset_size]
         
-        for cif_str, target in zip(tqdm(train_inputs, desc="Parsing structures"), train_outputs):
-            try:
-                # Parse CIF string to Structure
-                parser = CifParser.from_string(cif_str)
-                structure = parser.get_structures()[0]
-                structures.append(structure)
-                targets.append(target)
-            except Exception as e:
-                print(f"Warning: Failed to parse structure: {e}")
-                continue
+        for structure, target in zip(tqdm(train_inputs, desc="Loading structures"), train_outputs):
+            # train_inputs already contains Structure objects, no need to parse
+            structures.append(structure)
+            targets.append(target)
     
     return structures, targets
 
